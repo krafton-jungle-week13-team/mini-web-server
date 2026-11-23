@@ -40,8 +40,24 @@ void doit(int fd)
 
 ## 2. 헤더 파싱
 
+### 파일 분리
+
+헤더 파서는 `tiny.c`가 아니라 `http_parse.c`, `http_parse.h`에 둬요.
+`tiny.c`에는 `main`이 있어서 테스트 코드와 함께 링크할 수 없고, 함수가 `static`이면 다른 파일에서 호출할 수 없기 때문이에요.
+파서를 따로 두면 테스트 코드가 `http_parse.o`만 링크해서 함수를 직접 시험할 수 있어요.
+
+| 파일 | 내용 |
+| --- | --- |
+| `http_parse.h` | `req_headers_t` 정의, `trim`, `parse_content_length`, `read_requesthdrs` 선언 |
+| `http_parse.c` | 세 함수 구현 (`static` 없이) |
+| `tiny.c` | `#include "http_parse.h"` 후 `read_requesthdrs` 호출 |
+
 ```c
-#include <ctype.h>
+/* http_parse.h */
+#ifndef HTTP_PARSE_H
+#define HTTP_PARSE_H
+
+#include "csapp.h"
 
 typedef struct {
     char host[MAXLINE];
@@ -49,15 +65,39 @@ typedef struct {
     long content_length;
     int has_content_length;
 } req_headers_t;
+
+char *trim(char *s);
+int parse_content_length(const char *v, long *out);   /* 성공 0, 실패 -1 */
+int read_requesthdrs(rio_t *rp, req_headers_t *h);    /* 성공 0, 실패 -1 → 400 */
+
+#endif
 ```
+
+Makefile은 `tiny`가 `http_parse.o`도 함께 링크하도록 바꿔요.
+
+```makefile
+tiny: tiny.c csapp.o http_parse.o
+	$(CC) $(CFLAGS) -o tiny tiny.c csapp.o http_parse.o $(LIB)
+
+http_parse.o: http_parse.c http_parse.h
+	$(CC) $(CFLAGS) -c http_parse.c
+```
+
+### req_headers_t
 
 - `host`: `char[MAXLINE]` — `Host` 헤더 값이에요. 앞뒤 공백을 제거한 문자열로 저장해요. (예: `"localhost:8000"`)
 - `has_host`: `int` — `Host` 헤더를 이미 읽었는지 나타내요. 읽었으면 `1`, 아니면 `0`이에요. 값이 `1`인데 `Host`가 또 오면 중복이라 400이에요.
 - `content_length`: `long` — `Content-Length` 헤더 값이에요. 0 이상의 정수로 저장해요. (예: `14`) `has_content_length`가 `0`이면 의미가 없어요.
 - `has_content_length`: `int` — `Content-Length` 헤더가 있었는지 나타내요. 있으면 `1`, 없으면 `0`이에요. POST에서 `0`이면 411이에요.
 
+### 함수 구현 (http_parse.c)
+
 ```c
-static char *trim(char *s)
+/* http_parse.c */
+#include <ctype.h>
+#include "http_parse.h"
+
+char *trim(char *s)
 {
     char *end;
 
@@ -71,7 +111,7 @@ static char *trim(char *s)
     return s;
 }
 
-static int parse_content_length(const char *v, long *out)
+int parse_content_length(const char *v, long *out)
 {
     char *end;
     long n;
