@@ -14,6 +14,12 @@
 | 6 | body가 Content-Length보다 짧음 | 400 Bad Request |
 | 7 | 정적 → `serve_static` / 동적 → `serve_dynamic` | |
 
+body 최대 크기는 8KB예요. `tiny.c`와 `adder.c`가 같은 값을 쓰도록 `csapp.h`에 정의해요.
+
+```c
+#define MAXBODY 8192    /* POST body 최대 크기 (8KB) */
+```
+
 ```c
 void doit(int fd)
 {
