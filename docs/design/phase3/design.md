@@ -309,7 +309,6 @@ adder는 `REQUEST_METHOD`를 보고 데이터를 가져올 곳을 정해요.
 - **GET**: `QUERY_STRING` 환경 변수에서 읽어요.
 두 경우 모두 결과를 `buf`에 담고, 그 뒤의 `num1`, `num2` 파싱은 공통으로 처리해요.
 
-서버는 메서드를 대소문자 구분 없이 받고, 클라이언트가 보낸 그대로 `REQUEST_METHOD`에 넣어요. 그래서 adder도 `strcasecmp`로 비교해요. `strcmp`로 비교하면 `post`로 온 요청을 GET으로 보고 `QUERY_STRING`을 읽어요.
 
 ```c
 char buf[MAXBODY + 1];    /* buf[len] = '\0'를 위해 +1 */
@@ -317,7 +316,7 @@ char *method = getenv("REQUEST_METHOD");
 char *end;
 long len;
 
-if (method && !strcasecmp(method, "POST")) {   /* "post"도 POST로 처리 */
+if (method && !strcasecmp(method, "POST")) {
     char *lenstr = getenv("CONTENT_LENGTH");
     if (lenstr == NULL) { /* 에러 */ }
     len = strtol(lenstr, &end, 10);
