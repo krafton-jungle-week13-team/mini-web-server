@@ -113,5 +113,3 @@ QUERY_STRING='num1=3&num2=16' REQUEST_METHOD=GET ./cgi-bin/adder
 | TC-FN-09 | `POST /cgi-bin/adder`, body 8193바이트 | 413 | REQ-POST-06 |
 | TC-FN-10 | `POST /cgi-bin/adder`, `Content-Length: 20`, body 14바이트 후 연결 종료 | 400 | REQ-POST-07 |
 | TC-FN-11 | `POST /cgi-bin/adder`, `Content-Length: 0` | 200, adder 에러 메시지. 다음 요청도 정상 처리 | REQ-POST-07 |
-
-TC-FN-05, TC-FN-05-1은 메서드를 대소문자 구분 없이 받는다는 전제예요(기존 `tiny.c`의 `strcasecmp` 방식).
