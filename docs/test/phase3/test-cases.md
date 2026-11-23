@@ -105,7 +105,8 @@ QUERY_STRING='num1=3&num2=16' REQUEST_METHOD=GET ./cgi-bin/adder
 | TC-FN-02 | `GET /cgi-bin/adder?num1=3&num2=16` | 200, 본문에 `3 + 16 = 19` | REQ-POST-01, 10 |
 | TC-FN-03 | `PUT /cgi-bin/adder` | 501 | REQ-POST-02 |
 | TC-FN-04 | `DELETE /cgi-bin/adder` | 501 | REQ-POST-02 |
-| TC-FN-05 | `get /home.html` (소문자 메서드) | 501 | REQ-POST-02 |
+| TC-FN-05 | `get /home.html` (소문자 메서드) | 200 | REQ-POST-01 |
+| TC-FN-05-1 | `post /cgi-bin/adder`, body `num1=3&num2=16` (소문자 메서드) | 200, 본문에 `3 + 16 = 19` | REQ-POST-01, 09 |
 | TC-FN-06 | `POST /home.html`, body `num1=3&num2=16` | 405, 헤더에 `Allow: GET` | REQ-POST-03 |
 | TC-FN-07 | `POST /cgi-bin/adder`, `Content-Length` 없음 | 411 | REQ-POST-05 |
 | TC-FN-08 | `POST /cgi-bin/adder`, body 8192바이트 | 200 (adder 응답) | REQ-POST-06 |
@@ -113,4 +114,4 @@ QUERY_STRING='num1=3&num2=16' REQUEST_METHOD=GET ./cgi-bin/adder
 | TC-FN-10 | `POST /cgi-bin/adder`, `Content-Length: 20`, body 14바이트 후 연결 종료 | 400 | REQ-POST-07 |
 | TC-FN-11 | `POST /cgi-bin/adder`, `Content-Length: 0` | 200, adder 에러 메시지. 다음 요청도 정상 처리 | REQ-POST-07 |
 
-TC-FN-05는 메서드 이름을 대소문자 구분해서 비교한다는 전제예요(RFC 9110 9.1). 기존 `tiny.c`는 `strcasecmp`로 비교해서 `get`을 GET으로 받아들이므로, 구현에서 `strcmp`로 바꿔야 통과해요.
+TC-FN-05, TC-FN-05-1은 메서드를 대소문자 구분 없이 받는다는 전제예요(기존 `tiny.c`의 `strcasecmp` 방식).
