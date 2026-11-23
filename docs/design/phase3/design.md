@@ -305,3 +305,162 @@ n2 = atoi(eq2 + 1);
 
 - **인자 순서:** 원래 방식처럼 첫 번째 값을 `num1`, 두 번째 값을 `num2`로 봐요. 인자 이름은 확인하지 않아요.
 - **브라우저 테스트:** `tiny/form.html`은 `method="GET"`이라 POST를 보낼 수 없어요. POST는 `curl -d "num1=3&num2=16" http://localhost:8000/cgi-bin/adder`로 확인해요.
+
+## 6. 요청 예시
+
+각 예시는 서버에 실제로 보내는 요청 원문과 기대 응답이에요. 서버는 `./tiny 8000`으로 실행했다고 가정해요.
+요청 원문을 그대로 보낼 때는 `printf '...' | nc -N localhost 8000`을 써요(Linux 기준. `-N`은 입력이 끝나면 쓰기 방향을 닫아요).
+
+### 정상 POST → 200
+
+`Content-Length`는 body `num1=3&num2=16`의 바이트 수(14)예요.
+
+```http
+POST /cgi-bin/adder HTTP/1.0
+Host: localhost:8000
+Content-Type: application/x-www-form-urlencoded
+Content-Length: 14
+
+num1=3&num2=16
+```
+
+```bash
+curl -i -d "num1=3&num2=16" http://localhost:8000/cgi-bin/adder
+```
+
+기대 응답: `200 OK`, 본문에 `The answer is: 3 + 16 = 19`
+
+### 정상 GET → 200
+
+body 없이 `QUERY_STRING`으로 인자를 넘겨요.
+
+```http
+GET /cgi-bin/adder?num1=3&num2=16 HTTP/1.0
+Host: localhost:8000
+
+```
+
+```bash
+curl -i "http://localhost:8000/cgi-bin/adder?num1=3&num2=16"
+```
+
+기대 응답: `200 OK`, 본문에 `The answer is: 3 + 16 = 19`
+
+### 정적 파일에 POST → 405
+
+```http
+POST /home.html HTTP/1.0
+Host: localhost:8000
+Content-Length: 14
+
+num1=3&num2=16
+```
+
+```bash
+curl -i -d "num1=3&num2=16" http://localhost:8000/home.html
+```
+
+기대 응답: `405 Method Not Allowed`, 헤더에 `Allow: GET`
+
+### Content-Length 없는 POST → 411
+
+curl은 `-d`를 쓰면 `Content-Length`를 자동으로 붙이므로 `nc`로 보내요.
+
+```http
+POST /cgi-bin/adder HTTP/1.0
+Host: localhost:8000
+
+num1=3&num2=16
+```
+
+```bash
+printf 'POST /cgi-bin/adder HTTP/1.0\r\nHost: localhost:8000\r\n\r\nnum1=3&num2=16' | nc -N localhost 8000
+```
+
+기대 응답: `411 Length Required`
+
+### body가 8KB 초과 → 413
+
+`MAXBODY`(8192)보다 1바이트 큰 body를 보내요.
+
+```http
+POST /cgi-bin/adder HTTP/1.0
+Host: localhost:8000
+Content-Length: 8193
+
+num1=aaaa...(8193바이트)
+```
+
+```bash
+curl -i -d "num1=$(head -c 8188 /dev/zero | tr '\0' 'a')" http://localhost:8000/cgi-bin/adder
+```
+
+기대 응답: `413 Content Too Large`
+
+### body가 Content-Length보다 짧음 → 400
+
+`Content-Length`는 20인데 body는 14바이트만 보내고 연결을 닫아요.
+
+```http
+POST /cgi-bin/adder HTTP/1.0
+Host: localhost:8000
+Content-Length: 20
+
+num1=3&num2=16
+```
+
+```bash
+printf 'POST /cgi-bin/adder HTTP/1.0\r\nHost: localhost:8000\r\nContent-Length: 20\r\n\r\nnum1=3&num2=16' | nc -N localhost 8000
+```
+
+기대 응답: `400 Bad Request`
+
+### Content-Length 형식 오류 → 400
+
+```http
+POST /cgi-bin/adder HTTP/1.0
+Host: localhost:8000
+Content-Length: abc
+
+num1=3&num2=16
+```
+
+```bash
+printf 'POST /cgi-bin/adder HTTP/1.0\r\nHost: localhost:8000\r\nContent-Length: abc\r\n\r\nnum1=3&num2=16' | nc -N localhost 8000
+```
+
+기대 응답: `400 Bad Request`. `-1`, ` 14x`처럼 숫자로만 이루어지지 않은 값도 같아요.
+
+### 지원하지 않는 메서드 → 501
+
+```http
+PUT /cgi-bin/adder HTTP/1.0
+Host: localhost:8000
+Content-Length: 14
+
+num1=3&num2=16
+```
+
+```bash
+curl -i -X PUT -d "num1=3&num2=16" http://localhost:8000/cgi-bin/adder
+```
+
+기대 응답: `501 Not Implemented`
+
+### 인자 형식이 잘못된 body → adder 에러
+
+서버 검사는 모두 통과하고, adder의 파싱 검사에서 걸려요.
+
+```http
+POST /cgi-bin/adder HTTP/1.0
+Host: localhost:8000
+Content-Length: 5
+
+hello
+```
+
+```bash
+curl -i -d "hello" http://localhost:8000/cgi-bin/adder
+```
+
+기대 응답: `200 OK`, 본문에 adder의 에러 메시지(예: `Invalid arguments`). adder가 죽지 않아야 해요.
