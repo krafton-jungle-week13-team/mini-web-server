@@ -283,3 +283,25 @@ if (method && !strcmp(method, "POST")) {
 }
 /* 이후 buf에서 num1, num2 파싱 (공통) */
 ```
+
+### num1, num2 파싱
+
+POST body(`num1=3&num2=16`)와 `QUERY_STRING`은 형식이 같아서, 원래 adder의 파싱 방식을 그대로 써요.
+다만 원래 코드는 `&`나 `=`가 없으면 NULL 포인터를 건드려 adder가 죽어요. body는 클라이언트가 마음대로 보낼 수 있으니(예: `curl -d "hello"`), 파싱 전에 검사를 추가해요.
+GET도 `/cgi-bin/adder`처럼 `?` 없이 요청하면 `QUERY_STRING`이 빈 문자열이라 같은 검사가 필요해요.
+
+```c
+char *amp = strchr(buf, '&');
+char *eq1 = strchr(buf, '=');
+char *eq2 = amp ? strchr(amp + 1, '=') : NULL;
+
+if (amp == NULL || eq1 == NULL || eq1 > amp || eq2 == NULL) {
+    /* 에러 응답 (예: "Invalid arguments") */
+}
+*amp = '\0';
+n1 = atoi(eq1 + 1);
+n2 = atoi(eq2 + 1);
+```
+
+- **인자 순서:** 원래 방식처럼 첫 번째 값을 `num1`, 두 번째 값을 `num2`로 봐요. 인자 이름은 확인하지 않아요.
+- **브라우저 테스트:** `tiny/form.html`은 `method="GET"`이라 POST를 보낼 수 없어요. POST는 `curl -d "num1=3&num2=16" http://localhost:8000/cgi-bin/adder`로 확인해요.
