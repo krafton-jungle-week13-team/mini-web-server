@@ -15,14 +15,14 @@ int main(void)
         n2 = atoi(strchr(arg2, '=') + 1);
     }
 
-    sprintf(content, "QUERY_STRING=%s", buf);
-    sprintf(content, "Welcome to add.com: ");
-    sprintf(content, "%sTHE Internet addition portal.\r\n<p>", content);
-    sprintf(content, "%sThe answer is: %d + %d = %d\r\n<p>", content, n1, n2, n1 + n2);
-    sprintf(content, "%sThanks for visiting!\r\n", content);
+    int len = 0;
+    len += sprintf(content + len, "Welcome to add.com: ");
+    len += sprintf(content + len, "THE Internet addition portal.\r\n<p>");
+    len += sprintf(content + len, "The answer is: %d + %d = %d\r\n<p>", n1, n2, n1 + n2);
+    len += sprintf(content + len, "Thanks for visiting!\r\n");
 
     printf("Connection: close\r\n");
-    printf("Content-length: %d\r\n", (int)strlen(content));
+    printf("Content-length: %d\r\n", len);
     printf("Content-type: text/html\r\n\r\n");
     printf("%s", content);
     fflush(stdout);
