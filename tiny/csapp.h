@@ -43,6 +43,7 @@ extern char **environ;
 
 #define	MAXLINE	 8192
 #define MAXBUF   8192
+#define MAXBODY  8192  /* POST body 최대 크기 (8KB) */
 #define LISTENQ  1024
 
 void unix_error(char *msg);
