@@ -49,7 +49,14 @@ typedef struct {
     long content_length;
     int has_content_length;
 } req_headers_t;
+```
 
+- `host`: `char[MAXLINE]` — `Host` 헤더 값이에요. 앞뒤 공백을 제거한 문자열로 저장해요. (예: `"localhost:8000"`)
+- `has_host`: `int` — `Host` 헤더를 이미 읽었는지 나타내요. 읽었으면 `1`, 아니면 `0`이에요. 값이 `1`인데 `Host`가 또 오면 중복이라 400이에요.
+- `content_length`: `long` — `Content-Length` 헤더 값이에요. 0 이상의 정수로 저장해요. (예: `14`) `has_content_length`가 `0`이면 의미가 없어요.
+- `has_content_length`: `int` — `Content-Length` 헤더가 있었는지 나타내요. 있으면 `1`, 없으면 `0`이에요. POST에서 `0`이면 411이에요.
+
+```c
 static char *trim(char *s)
 {
     char *end;
