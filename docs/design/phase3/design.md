@@ -1,26 +1,38 @@
-# Phase 3 설계: HTTP 서버 POST 지원
+# HTTP 서버 POST 지원
 
-이 문서를 읽으면 Tiny 서버가 POST 요청의 헤더를 검사하고, body를 읽어 CGI 프로그램의 stdin으로 넘기기까지 어떤 함수를 어떻게 바꾸면 되는지 알 수 있어요.
-요구사항은 [Phase 3 요구사항](../../requirements/phase3/requirements.md)을 기준으로 해요.
+## 1. 전체 흐름
 
-## 상수
+요청 하나는 `doit`에서 아래 순서로 처리돼요. 검사에 걸리면 그 자리에서 에러 응답을 보내고 끝나요.
+
+| 순서 | 단계 | 실패 시 |
+| --- | --- | --- |
+| 1 | 요청줄 파싱 (GET/POST만 허용) | 501 Not Implemented |
+| 2 | 헤더 파싱 (`read_requesthdrs`) | 400 Bad Request |
+| 3 | 정적 파일에 POST | 405 Method Not Allowed |
+| 4 | POST인데 Content-Length 없음 | 411 Length Required |
+| 5 | body가 `MAXBODY`보다 큼 | 413 Content Too Large |
+| 6 | body가 Content-Length보다 짧음 | 400 Bad Request |
+| 7 | 정적 → `serve_static` / 동적 → `serve_dynamic` | |
 
 ```c
-#define MAXBODY 8192    /* POST body 최대 크기: 8KB */
+void doit(int fd)
+{
+    char body[MAXBODY + 1];        /* ① 여기서 만들어져요 (doit의 스택) */
+    req_headers_t hdrs;
+    ...
+    /* 요청줄 파싱 → 501 검사 */
+    /* read_requesthdrs → 400 검사 */
+    /* parse_uri → 405 검사 → 411 검사 → 413 검사 */
+    /* body 읽기 → 400 검사 (3장 참고) */   /* ② 여기서 채워져요 */
+
+    if (is_static)
+        serve_static(fd, filename, filesize);
+    else
+        serve_dynamic(fd, filename, cgiargs, method, body, body_len);  /* ③ 전달 */
+}
 ```
 
-## 처리 순서
-
-`doit()`은 아래 순서로 검사하고, 처음 실패한 단계의 상태 코드로 응답해요.
-
-1. 요청줄 파싱 → 501 (GET, POST 외의 메서드)
-2. `read_requesthdrs()` → 400 (헤더 형식 오류)
-3. `parse_uri()` → 405 (정적 경로로 POST)
-4. 411 (POST에 Content-Length 없음)
-5. 413 (body가 `MAXBODY`보다 큼)
-6. body 읽기 → 400 (body가 Content-Length보다 짧음)
-
-## 헤더 파싱
+## 2. 헤더 파싱
 
 ```c
 #include <ctype.h>
@@ -103,28 +115,22 @@ int read_requesthdrs(rio_t *rp, req_headers_t *h)
 }
 ```
 
-`read_requesthdrs()`가 `-1`을 돌려주면 `doit()`은 400 Bad Request로 응답해요.
-
-- **헤더의 끝:** 빈 줄(`\r\n`)이 나오면 헤더가 끝나요. 빈 줄이 오기 전에 연결이 끊기면(EOF) 불완전한 요청이라 400이에요.
-- **너무 긴 줄:** `Rio_readlineb`는 줄이 `MAXLINE`보다 길면 `\n` 없이 잘라서 돌려줘요. 그래서 읽은 줄이 `\n`으로 끝나는지 꼭 확인해야 해요. 안 그러면 줄의 나머지가 다음 헤더로 읽혀요.
-- **콜론 위치:** 첫 번째 `:`를 기준으로 나눠요. `:`가 없거나, 이름이 비었거나, 이름과 `:` 사이에 공백이 있으면(`Host : x`) 400이에요.
-- **이름은 대소문자 구분 없음:** `host`, `HOST`도 같은 헤더예요. `strcasecmp`로 비교해요.
-- **값 앞뒤 공백 제거:** `Host:  localhost  ` → `localhost`
-- **중복 헤더:** Host가 두 번 오거나, Content-Length가 서로 다른 값으로 두 번 오면 400이에요.
-- **Content-Length 형식:** 숫자로 시작하지 않거나(`-1`, `abc`) 숫자 뒤에 다른 문자가 붙으면 400이에요.
-
-## 유효성 검사
+- **헤더의 끝**: 빈 줄(`\r\n`)이 나오면 헤더가 끝나요. 빈 줄이 오기 전에 연결이 끊기면(EOF) 불완전한 요청이라 400이에요.
+- **너무 긴 줄**: `Rio_readlineb`는 줄이 `MAXLINE`보다 길면 `\n` 없이 잘라서 돌려줘요. 그래서 읽은 줄이 `\n`으로 끝나는지 꼭 확인해야 해요. 안 그러면 줄의 나머지가 다음 헤더로 읽혀요.
+- **콜론 위치**: 첫 번째 `:`를 기준으로 나눠요. `:`가 없거나, 이름이 비었거나, 이름과 `:` 사이에 공백이 있으면(`Host : x`) 400이에요.
+- **이름은 대소문자 구분 없음**: `host`, `HOST`도 같은 헤더예요. `strcasecmp`로 비교해요.
+- **값 앞뒤 공백 제거**: `Host:  localhost  ` → `localhost`
+- **Content-Length**: 숫자로만 이루어져야 하고(음수·공백·문자 불가), 여러 번 나오면 값이 모두 같아야 해요.
+## 3. 유효성 검사 + body 읽기
 
 ### clienterror 시그니처 변경
 
-405 응답에 `Allow` 헤더를 넣기 위해 `clienterror()`에 `allow` 인자를 추가해요.
+405 응답에는 `Allow` 헤더가 필요해서 `clienterror`에 `allow` 인자를 하나 추가해요. 다른 에러에서는 마지막 인자로 `NULL`을 넘겨요.
 
 ```c
 void clienterror(int fd, char *cause, char *errnum,
                  char *shortmsg, char *longmsg, char *allow);
 ```
-
-- `allow`: `char *` — 응답에 넣을 `Allow` 헤더 값이에요. 405일 때만 `"GET"`을 넘기고, 다른 에러에서는 `NULL`을 넘겨요.
 
 ```c
 sprintf(buf, "HTTP/1.0 %s %s\r\n", errnum, shortmsg);
@@ -135,17 +141,17 @@ if (allow != NULL) {                       /* 405일 때만 "GET" 전달 */
 }
 ```
 
-### 405, 411, 413 검사와 body 읽기
-
-405는 정적 파일 경로(예: `/home.html`)로 POST 요청이 온 경우예요.
+### 검사 코드 (doit 안)
 
 ```c
+/* 405: 정적 파일 경로(예: /home.html)로 POST 요청이 오는 경우 */
 if (is_post && is_static) {
     clienterror(fd, filename, "405", "Method Not Allowed",
                 "POST is not allowed for static content", "GET");
     return;
 }
 
+/* 411: POST인데 Content-Length가 없는 경우 */
 if (is_post && !hdrs.has_content_length) {
     clienterror(fd, "body", "411", "Length Required",
                 "POST request requires Content-Length", NULL);
@@ -154,11 +160,14 @@ if (is_post && !hdrs.has_content_length) {
 
 long body_len = hdrs.has_content_length ? hdrs.content_length : 0;
 
+/* 413: body가 버퍼보다 큰 경우 */
 if (body_len > MAXBODY) {
     clienterror(fd, "body", "413", "Content Too Large",
                 "Request body is too large", NULL);
     return;
 }
+
+/* body 읽기 + 400: 실제 body가 Content-Length보다 짧은 경우 */
 if (body_len > 0) {
     n = Rio_readnb(&rio, body, body_len);
     if (n != body_len) {
@@ -170,46 +179,42 @@ if (body_len > 0) {
 body[body_len] = '\0';
 ```
 
-body는 헤더를 읽은 같은 `rio` 버퍼로 읽어요. 새 버퍼로 읽으면 헤더와 함께 이미 버퍼에 들어온 body 일부를 잃어요.
+## 4. CGI로 body 전달
 
-## body 전달
+### 환경 변수
 
-### doit
-
-```c
-void doit(int fd)
-{
-    char body[MAXBODY + 1];        /* ① 여기서 만들어져요 (doit의 스택) */
-    ...
-    /* 요청줄 파싱 → 501 검사 */
-    /* read_requesthdrs → 400 검사 */
-    /* parse_uri → 405 검사 → 411 검사 → 413 검사 */
-
-    n = Rio_readnb(&rio, body, body_len);   /* ② 여기서 채워져요 */
-    body[body_len] = '\0';
-
-    if (is_static)
-        serve_static(fd, filename, filesize);
-    else
-        serve_dynamic(fd, filename, cgiargs, method, body, body_len);  /* ③ 전달 */
-}
-```
+| 항목 | GET | POST |
+| --- | --- | --- |
+| 데이터 위치 | URL의 `?` 뒤 (`/cgi-bin/adder?num1=3&num2=16`) | 요청 body (`num1=3&num2=16`) |
+| `REQUEST_METHOD` | `"GET"` | `"POST"` |
+| `QUERY_STRING` | `?` 뒤 문자열 (`"num1=3&num2=16"`) | `""` (빈 문자열). URL에 `?`가 있으면 그 값 |
+| `CONTENT_LENGTH` | 설정하지 않음 (body가 없으니까) | body 바이트 수 (`"14"`) |
+| `CONTENT_TYPE` | 설정하지 않음 | 요청 헤더 값 그대로 (`"application/x-www-form-urlencoded"`). 선택 항목, 현재 미구현 |
 
 ### serve_dynamic
 
-부모가 body를 파이프에 쓰고, 자식은 파이프의 읽기 끝을 stdin으로 받아요.
+body는 pipe로 CGI 자식의 stdin에 넣어 줘요. 부모가 body를 쓰고 쓰기 끝을 닫으면 자식은 EOF를 받아요.
 
 ```c
 void serve_dynamic(int fd, char *filename, char *cgiargs,
                    char *method, char *body, long body_len)
 {
     int p[2];
-    char lenbuf[32];
+    char buf[MAXLINE], lenbuf[32];
     char *emptylist[] = { NULL };
 
-    /* 상태줄 + Server 헤더 전송 (기존 코드) */
+    /* pipe를 먼저 만들어요. 상태줄(200)을 보낸 뒤에 실패하면 500을 보낼 수 없어요. */
+    if (pipe(p) < 0) {
+        clienterror(fd, filename, "500", "Internal Server Error",
+                    "Failed to create pipe", NULL);
+        return;
+    }
 
-    if (pipe(p) < 0) { /* 500 */ }
+    /* 상태줄 + Server 헤더 전송 (기존 코드) */
+    sprintf(buf, "HTTP/1.0 200 OK\r\n");
+    Rio_writen(fd, buf, strlen(buf));
+    sprintf(buf, "Server: Tiny Web Server\r\n");
+    Rio_writen(fd, buf, strlen(buf));
 
     if (Fork() == 0) {                       /* 자식 */
         close(p[1]);
@@ -234,24 +239,26 @@ void serve_dynamic(int fd, char *filename, char *cgiargs,
 }
 ```
 
-## 환경변수 세팅
+- **SIGPIPE 처리**: CGI가 body를 다 읽기 전에 끝나면 `rio_writen`이 SIGPIPE를 받아 서버 프로세스가 죽어요. `main`에서 무시하도록 설정해요.
+```c
+int main(int argc, char **argv)
+{
+    Signal(SIGPIPE, SIG_IGN);
+    ...
+}
+```
 
-| 항목 | GET | POST |
-| --- | --- | --- |
-| 데이터 위치 | URL의 `?` 뒤 (`/cgi-bin/adder?num1=3&num2=16`) | 요청 body (`num1=3&num2=16`) |
-| `REQUEST_METHOD` | `"GET"` | `"POST"` |
-| `QUERY_STRING` | `?` 뒤 문자열 (`"num1=3&num2=16"`) | `""` (빈 문자열). URL에 `?`가 있으면 그 값 |
-| `CONTENT_LENGTH` | 설정하지 않음 (body가 없으니까) | body 바이트 수 (`"14"`) |
-| `CONTENT_TYPE` | 설정하지 않음 | 요청 헤더 값 그대로 (`"application/x-www-form-urlencoded"`). 선택 |
+## 5. CGI 프로그램(adder) 수정
 
-## adder 수정
+adder는 `REQUEST_METHOD`를 보고 데이터를 가져올 곳을 정해요.
 
-adder는 `REQUEST_METHOD`를 보고 입력을 어디서 읽을지 정해요.
-POST면 `CONTENT_LENGTH`를 환경변수에서 가져와 그 길이만큼 body를 stdin에서 읽고, GET이면 `QUERY_STRING`을 읽어요.
+- **POST**: `CONTENT_LENGTH` 환경 변수에서 길이를 가져오고, 그 길이만큼 stdin에서 body를 읽어요.
+- **GET**: `QUERY_STRING` 환경 변수에서 읽어요.
+두 경우 모두 결과를 `buf`에 담고, 그 뒤의 `num1`, `num2` 파싱은 공통으로 처리해요.
 
 ```c
+char buf[MAXBODY + 1];    /* buf[len] = '\0'를 위해 +1 */
 char *method = getenv("REQUEST_METHOD");
-char buf[MAXBODY + 1];
 char *end;
 long len;
 
