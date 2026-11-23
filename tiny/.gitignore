@@ -1,0 +1,4 @@
+*.o
+tiny
+cgi-bin/adder
+*~
