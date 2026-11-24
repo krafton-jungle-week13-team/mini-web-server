@@ -10,6 +10,14 @@ void serve_dynamic(int fd, char *filename, char *cgiargs,
 void clienterror(int fd, char *cause, char *errnum,
                  char *shortmsg, char *longmsg, char *allow);
 
+/* 이미 종료됐지만 부모가 아직 종료 상태를 거둬 가지 않은 좀비 프로세스 처리 */             
+void sigchld_handler(int sig)
+{
+    while (waitpid(-1, 0, WNOHANG) > 0)
+    ;
+    return;
+}
+
 int main(int argc, char **argv)
 {
     int listenfd, connfd;
@@ -25,6 +33,8 @@ int main(int argc, char **argv)
     /* CGI가 body를 다 읽기 전에 끝나도 pipe 쓰기에서 서버가 죽지 않게 한다 */
     Signal(SIGPIPE, SIG_IGN);
 
+    /* 자식 프로세스의 상태가 바뀔 때 핸들러 실행 */
+    Signal(SIGCHLD, sigchld_handler);
     listenfd = Open_listenfd(argv[1]);
 
      while (1) {
@@ -32,7 +42,12 @@ int main(int argc, char **argv)
         connfd = Accept(listenfd, (SA *)&clientaddr, &clientlen);
         Getnameinfo((SA *) &clientaddr, clientlen, client_hostname, MAXLINE, client_port, MAXLINE, 0);
         printf("Accepted connection from (%s, %s)\n", client_hostname, client_port);
-        doit(connfd);
+        if (Fork() == 0) {
+            Close(listenfd);
+            doit(connfd);
+            Close(connfd);
+            exit(0);
+        }
         Close(connfd);
      }
     exit(0);
