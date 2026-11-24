@@ -51,10 +51,10 @@ int main(int argc, char **argv)
     /* main은 연결을 받아 버퍼에 넣기만 함. 버퍼 차면 빈 칸이 날 때까지 기다림 */
     while (1) {
         clientlen = sizeof(struct sockaddr_storage);
-        connfd = Accept(listenfd, (SA *)&clientaddr, &clientlen); /* accept로 연결 소켓 생성 후 주소 저장 */
-        Getnameinfo((SA *) &clientaddr, clientlen, client_hostname, MAXLINE, client_port, MAXLINE, 0); /* 소켓 주소 구조체 -> 호스트 이름, 포트 번호 문자열로 변환*/
+        connfd = Accept(listenfd, (SA *)&clientaddr, &clientlen); 
+        Getnameinfo((SA *) &clientaddr, clientlen, client_hostname, MAXLINE, client_port, MAXLINE, 0);
         printf("Accepted connection from (%s, %s)\n", client_hostname, client_port);
-        sbuf_insert(&sbuf, connfd); /* 버퍼에 connfd 주소 넣기 */
+        sbuf_insert(&sbuf, connfd);
     }
     exit(0);
 }
@@ -62,7 +62,7 @@ int main(int argc, char **argv)
 /* worker 스레드: 버퍼에서 connfd를 꺼내 요청 하나를 처리하고 닫기를 반복한다 */
 void *worker(void *vargp)
 {
-    Pthread_detach(pthread_self());   /* 아무도 join하지 않으므로 datach로 끝나면 자동 회수 */
+    Pthread_detach(pthread_self()); 
     while (1) {
         int connfd = sbuf_remove(&sbuf);
         doit(connfd);
