@@ -1,0 +1,1 @@
+document.getElementById("classic").textContent = "실행됨";
