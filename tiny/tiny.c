@@ -10,41 +10,112 @@ void serve_dynamic(int fd, char *filename, char *cgiargs,
 void clienterror(int fd, char *cause, char *errnum,
                  char *shortmsg, char *longmsg, char *allow);
 void command(void);
-  
+
+typedef struct {
+    int maxfd;
+    fd_set read_set;
+    fd_set ready_set;
+    int nready;
+    int maxi;
+    int clientfd[FD_SETSIZE];
+    rio_t clientrio[FD_SETSIZE];
+} pool;
+
+void init_pool(int listenfd, pool *p);
+void add_client(int connfd, pool *p);
+void check_clients(pool *p);
+
 int main(int argc, char **argv)
 {
     int listenfd, connfd;
     socklen_t clientlen;
     struct sockaddr_storage clientaddr;
     char client_hostname[MAXLINE], client_port[MAXLINE];
-    fd_set read_set, ready_set;
+    static pool pool;
 
     if (argc != 2) {
         fprintf(stderr, "usage: %s <port>\n", argv[0]);
         exit(0);
     }
 
-    /* CGI가 body를 다 읽기 전에 끝나도 pipe 쓰기에서 서버가 죽지 않게 한다 */
     Signal(SIGPIPE, SIG_IGN);
 
     listenfd = Open_listenfd(argv[1]);
-
-    FD_ZERO(&read_set);
-    FD_SET(STDIN_FILENO, &read_set);
-    FD_SET(listenfd, &read_set);
+    init_pool(listenfd, &pool);
 
     while (1) {
-        ready_set = read_set;
-        Select(listenfd+1, &ready_set, NULL, NULL, NULL);
-        if (FD_ISSET(STDIN_FILENO, &ready_set))
+        pool.ready_set = pool.read_set;
+        pool.nready = Select(pool.maxfd+1, &pool.ready_set, NULL, NULL, NULL); // 준비된 fd 개수 기록, check_client에서 사용
+
+        if (FD_ISSET(STDIN_FILENO, &pool.ready_set)) {
+            pool.nready--;
             command();
-        if (FD_ISSET(listenfd, &ready_set)) {
+        }
+        if (FD_ISSET(listenfd, &pool.ready_set)) {
             clientlen = sizeof(struct sockaddr_storage);
             connfd = Accept(listenfd, (SA *)&clientaddr, &clientlen);
             Getnameinfo((SA *) &clientaddr, clientlen, client_hostname, MAXLINE, client_port, MAXLINE, 0);
             printf("Accepted connection from (%s, %s)\n", client_hostname, client_port);
+            add_client(connfd, &pool);
+        }
+        check_clients(&pool);
+    }
+}
+
+/* 활성 클라이언트로 pool 초기화 */
+void init_pool(int listenfd, pool *p)
+{
+    int i;
+    p->maxi = -1; // check_clients에서 사용
+    for (i=0; i< FD_SETSIZE; i++)
+        p->clientfd[i] = -1; 
+
+    p->maxfd = listenfd; // 감시 할 가장 큰 fd 번호, select에 전달
+    FD_ZERO(&p->read_set);
+    FD_SET(listenfd, &p->read_set);
+    FD_SET(STDIN_FILENO, &p->read_set);
+}
+
+/* 새로운 클라이언트 연결을 pool에 추가하는 함수*/
+void add_client(int connfd, pool *p)
+{
+    int i;
+    p->nready--;
+    for (i = 0; i < FD_SETSIZE; i++) { // 이용 가능한 슬롯 찾기
+        if (p->clientfd[i] < 0) {
+            p->clientfd[i] = connfd;
+            Rio_readinitb(&p->clientrio[i], connfd);
+
+            FD_SET(connfd, &p->read_set);
+
+            if (connfd > p->maxfd)
+                p->maxfd = connfd;
+            if (i > p->maxi)
+                p->maxi = i;
+            break;
+        }
+    }
+    if (i == FD_SETSIZE)
+        app_error("add_client error: Too many clients");
+}
+
+/* 준비된 클라이언트 연결에 대해 요청을 처리하는 함수 */
+void check_clients(pool *p)
+{
+    int i, connfd, n;
+    char buf[MAXLINE];
+    rio_t rio;
+
+    for (i = 0; (i <= p->maxi) && (p->nready > 0); i++) {
+        connfd = p->clientfd[i];
+        rio = p->clientrio[i];
+
+        if ((connfd > 0) && (FD_ISSET(connfd, &p->ready_set))) {
+            p->nready--;
             doit(connfd);
             Close(connfd);
+            FD_CLR(connfd, &p->read_set);
+            p->clientfd[i] = -1;
         }
     }
 }
