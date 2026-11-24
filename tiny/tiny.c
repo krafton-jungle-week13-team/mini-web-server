@@ -1,9 +1,21 @@
 #include "csapp.h"
 #include "http_parse.h"
+#include "sbuf.h"
 #ifdef __linux__
 #include <sys/syscall.h>
 #endif
 
+/* 스레드 풀 크기. make CFLAGS="... -DNTHREADS=8"처럼 바꿀 수 있다. */
+#ifndef NTHREADS
+#define NTHREADS 4      /* 미리 만들어 두는 worker 스레드 수 */
+#endif
+#ifndef SBUFSIZE
+#define SBUFSIZE 16     /* worker를 기다리는 연결을 담는 칸 수 */
+#endif
+
+static sbuf_t sbuf;     /* main(생산자) → worker(소비자)로 connfd를 넘기는 버퍼 */
+
+void *worker(void *vargp);
 void doit(int fd);
 int parse_uri(char *uri, char *filename, char *cgiargs);
 void serve_static(int fd, char *filename, int filesize);
@@ -15,10 +27,11 @@ void clienterror(int fd, char *cause, char *errnum,
 
 int main(int argc, char **argv)
 {
-    int listenfd, connfd;
+    int i, listenfd, connfd;
     socklen_t clientlen;
     struct sockaddr_storage clientaddr;
     char client_hostname[MAXLINE], client_port[MAXLINE];
+    pthread_t tid;
 
     if (argc != 2) {
         fprintf(stderr, "usage: %s <port>\n", argv[0]);
@@ -30,15 +43,32 @@ int main(int argc, char **argv)
 
     listenfd = Open_listenfd(argv[1]);
 
-     while (1) {
+    /* worker를 미리 만들어 두고 요청마다 재사용한다 (CS:APP 12.5.5 prethreading) */
+    sbuf_init(&sbuf, SBUFSIZE);
+    for (i = 0; i < NTHREADS; i++)
+        Pthread_create(&tid, NULL, worker, NULL);
+
+    /* main은 연결을 받아 버퍼에 넣기만 한다. 버퍼가 차면 빈 칸이 날 때까지 기다린다. */
+    while (1) {
         clientlen = sizeof(struct sockaddr_storage);
         connfd = Accept(listenfd, (SA *)&clientaddr, &clientlen);
         Getnameinfo((SA *) &clientaddr, clientlen, client_hostname, MAXLINE, client_port, MAXLINE, 0);
         printf("Accepted connection from (%s, %s)\n", client_hostname, client_port);
+        sbuf_insert(&sbuf, connfd);
+    }
+    exit(0);
+}
+
+/* worker 스레드: 버퍼에서 connfd를 꺼내 요청 하나를 처리하고 닫기를 반복한다 */
+void *worker(void *vargp)
+{
+    Pthread_detach(pthread_self());   /* 아무도 join하지 않으므로 끝나면 자동 회수 */
+    while (1) {
+        int connfd = sbuf_remove(&sbuf);
         doit(connfd);
         Close(connfd);
-     }
-    exit(0);
+    }
+    return NULL;
 }
 
 void doit(int fd)
