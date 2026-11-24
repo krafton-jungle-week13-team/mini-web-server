@@ -1,6 +1,8 @@
 #include "csapp.h"
 #include "http_parse.h"
 
+void *thread(void *vargp);
+static void set_cloexec(int fd);
 void doit(int fd);
 int parse_uri(char *uri, char *filename, char *cgiargs);
 void serve_static(int fd, char *filename, int filesize);
@@ -12,10 +14,11 @@ void clienterror(int fd, char *cause, char *errnum,
 
 int main(int argc, char **argv)
 {
-    int listenfd, connfd;
+    int listenfd, *connfdp, rc;
     socklen_t clientlen;
     struct sockaddr_storage clientaddr;
     char client_hostname[MAXLINE], client_port[MAXLINE];
+    pthread_t tid;
 
     if (argc != 2) {
         fprintf(stderr, "usage: %s <port>\n", argv[0]);
@@ -26,16 +29,55 @@ int main(int argc, char **argv)
     Signal(SIGPIPE, SIG_IGN);
 
     listenfd = Open_listenfd(argv[1]);
+    set_cloexec(listenfd);                   /* CGI 자식이 exec할 때 listenfd를 물려받지 않게 */
 
-     while (1) {
+    while (1) {
         clientlen = sizeof(struct sockaddr_storage);
-        connfd = Accept(listenfd, (SA *)&clientaddr, &clientlen);
+        /* connfd마다 malloc한 칸을 따로 준다.
+         * 지역 변수 주소(&connfd)를 넘기면 다음 accept가 값을 덮어써서
+         * 두 스레드가 같은 connfd를 쓰는 경쟁이 생긴다 (CS:APP 12.3.8) */
+        connfdp = Malloc(sizeof(int));
+        *connfdp = accept(listenfd, (SA *)&clientaddr, &clientlen);
+        if (*connfdp < 0) {                  /* ECONNABORTED 등: 이 연결만 버리고 서버는 계속 */
+            free(connfdp);
+            continue;
+        }
+        set_cloexec(*connfdp);               /* 다른 스레드의 CGI 자식에게 넘어가지 않게 */
         Getnameinfo((SA *) &clientaddr, clientlen, client_hostname, MAXLINE, client_port, MAXLINE, 0);
         printf("Accepted connection from (%s, %s)\n", client_hostname, client_port);
-        doit(connfd);
-        Close(connfd);
-     }
+
+        if ((rc = pthread_create(&tid, NULL, thread, connfdp)) != 0) {
+            fprintf(stderr, "pthread_create error: %s\n", strerror(rc));
+            close(*connfdp);
+            free(connfdp);
+        }
+    }
     exit(0);
+}
+
+/* 연결 하나를 처리하는 피어 스레드 */
+void *thread(void *vargp)
+{
+    int connfd = *((int *)vargp);
+
+    Pthread_detach(pthread_self());          /* join하지 않으므로 끝나면 스스로 정리되게 */
+    Free(vargp);                             /* main이 malloc한 칸은 값을 옮긴 뒤 해제 */
+    doit(connfd);
+    Close(connfd);                           /* fd는 스레드끼리 공유하므로 main은 닫지 않는다 */
+    return NULL;
+}
+
+/* exec할 때 fd가 자동으로 닫히게 한다.
+ * 스레드는 fd를 공유하고 fork는 그 순간 열린 fd를 전부 복사하므로, 표시가 없으면
+ * 다른 스레드가 연 connfd/pipe가 CGI 자식에게 넘어가 참조 카운트가 남는다
+ * → 그 연결의 클라이언트는 CGI가 끝날 때까지 연결 종료(EOF)를 받지 못한다.
+ * accept/pipe와 이 호출 사이에 다른 스레드가 fork하면 막지 못하는 작은 틈이 있다.
+ * Linux의 accept4(SOCK_CLOEXEC)/pipe2(O_CLOEXEC)는 이 틈이 없지만 macOS에는 없어서 쓰지 않는다. */
+static void set_cloexec(int fd)
+{
+    int flags = fcntl(fd, F_GETFD);
+    if (flags >= 0)
+        fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
 }
 
 void doit(int fd)
@@ -50,8 +92,10 @@ void doit(int fd)
     rio_t rio;
     req_headers_t hdrs;
 
+    /* 스레드 안에서는 대문자 래퍼를 피한다. 에러 때 exit()을 불러 서버 전체가 죽기 때문이다.
+     * 소문자 rio 함수는 -1을 돌려주므로 이 연결만 정리하고 돌아간다. */
     Rio_readinitb(&rio, fd);
-    if (!Rio_readlineb(&rio, buf, MAXLINE))
+    if (rio_readlineb(&rio, buf, MAXLINE) <= 0)   /* EOF 또는 ECONNRESET 등 */
         return;
     printf("Request headers:\n");
     printf("%s", buf);
@@ -97,7 +141,7 @@ void doit(int fd)
 
     /* body 읽기 + 400: 실제 body가 Content-Length보다 짧은 경우 */
     if (body_len > 0) {
-        n = Rio_readnb(&rio, body, body_len);
+        n = rio_readnb(&rio, body, body_len);    /* 에러면 -1 → 아래 400 처리 */
         if (n != body_len) {
             clienterror(fd, "body", "400", "Bad Request",
                         "Request body is shorter than Content-Length", NULL);
@@ -169,11 +213,18 @@ void serve_static(int fd, char *filename, int filesize)
     len += sprintf(buf + len, "Content-type: %s\r\n\r\n", filetype);
     Rio_writen(fd, buf, len);
 
-    srcfd = Open(filename, O_RDONLY, 0);
-    srcp = Mmap(0, filesize, PROT_READ, MAP_PRIVATE, srcfd, 0);
-    Close(srcfd);
+    if (filesize == 0)                       /* mmap은 길이 0이면 실패하므로 본문 없이 끝낸다 */
+        return;
+
+    /* O_CLOEXEC: 다른 스레드의 CGI 자식에게 이 fd가 넘어가지 않게 한다 */
+    if ((srcfd = open(filename, O_RDONLY | O_CLOEXEC, 0)) < 0)
+        return;
+    srcp = mmap(0, filesize, PROT_READ, MAP_PRIVATE, srcfd, 0);
+    close(srcfd);
+    if (srcp == MAP_FAILED)
+        return;
     Rio_writen(fd, srcp, filesize);
-    Munmap(srcp, filesize);
+    munmap(srcp, filesize);
 }
 
 static const struct { const char *ext; const char *type; } mime_table[] = {
@@ -211,6 +262,7 @@ void serve_dynamic(int fd, char *filename, char *cgiargs,
                    char *method, char *body, long body_len)
 {
     int p[2];
+    pid_t pid;
     char buf[MAXLINE], lenbuf[32], *emptylist[] = { NULL };
 
     /* pipe를 먼저 만든다. 상태줄(200)을 보낸 뒤에 실패하면 500을 보낼 수 없다. */
@@ -219,13 +271,24 @@ void serve_dynamic(int fd, char *filename, char *cgiargs,
                     "Failed to create pipe", NULL);
         return;
     }
+    /* 다른 스레드의 CGI 자식이 이 pipe를 물려받으면, 그 자식이 끝날 때까지
+     * 쓰기 끝의 참조가 남아 우리 CGI가 stdin에서 EOF를 받지 못한다.
+     * 우리 자식에게 필요한 읽기 끝은 아래 dup2로 stdin에 복사되는데,
+     * dup2로 만든 fd에는 CLOEXEC가 붙지 않아서 exec 후에도 남는다. */
+    set_cloexec(p[0]);
+    set_cloexec(p[1]);
 
     sprintf(buf, "HTTP/1.0 200 OK\r\n");
     Rio_writen(fd, buf, strlen(buf));
     sprintf(buf, "Server: Tiny Web Server\r\n");
     Rio_writen(fd, buf, strlen(buf));
 
-    if (Fork() == 0) {                       /* 자식 */
+    if ((pid = fork()) < 0) {                /* Fork()는 실패 시 exit()하므로 소문자 사용 */
+        close(p[0]);
+        close(p[1]);
+        return;                              /* 상태줄은 이미 보냈으니 연결만 닫힌다 */
+    }
+    if (pid == 0) {                          /* 자식 */
         close(p[1]);
         setenv("REQUEST_METHOD", method, 1);
         setenv("QUERY_STRING", cgiargs, 1);
@@ -244,7 +307,11 @@ void serve_dynamic(int fd, char *filename, char *cgiargs,
     if (body_len > 0)
         rio_writen(p[1], body, body_len);    /* 실패해도 서버가 죽지 않게 소문자 버전 사용 */
     close(p[1]);                             /* 자식에게 EOF 전달 */
-    Wait(NULL);
+    /* Wait(NULL)은 "아무 자식이나" 회수한다. 여러 스레드가 동시에 CGI를 돌리면
+     * 다른 스레드의 자식을 가로채고, 빼앗긴 쪽 Wait는 ECHILD로 exit() → 서버 전체 종료.
+     * 그래서 내가 만든 pid만 기다린다. */
+    while (waitpid(pid, NULL, 0) < 0 && errno == EINTR)
+        ;
 }
 
 void clienterror(int fd, char *cause, char *errnum,

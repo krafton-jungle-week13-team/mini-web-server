@@ -41,7 +41,9 @@ int read_requesthdrs(rio_t *rp, req_headers_t *h)
 
     memset(h, 0, sizeof(*h));
 
-    while ((n = Rio_readlineb(rp, buf, MAXLINE)) > 0) {
+    /* 소문자 rio_readlineb: 에러(-1)면 루프를 빠져나가 -1을 돌려준다.
+     * 대문자 래퍼는 exit()을 불러 스레드 서버 전체를 죽인다. */
+    while ((n = rio_readlineb(rp, buf, MAXLINE)) > 0) {
         if (!strcmp(buf, "\r\n"))
             return 0;
         if (buf[n - 1] != '\n')          /* MAXLINE보다 긴 줄은 잘려서 \n이 없다 */
