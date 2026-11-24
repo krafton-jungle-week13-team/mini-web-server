@@ -1,7 +1,51 @@
 #include "csapp.h"
 #include "http_parse.h"
 
-void doit(int fd);
+/* ===== 연결 상태 ===== */
+
+enum { READ_REQLINE, READ_HEADERS, READ_BODY };   /* 요청을 어디까지 받았는지 */
+enum { KEEP = 0, CLOSE = 1 };                     /* 단계 함수 반환값: 연결 유지 / 닫기 */
+
+/* 연결 하나의 진행 상황 (상태 기계 하나) */
+typedef struct {
+    rio_t rio;                                    /* 읽다 남은 버퍼 */
+    int state;
+    char method[MAXLINE], uri[MAXLINE], version[MAXLINE];
+    req_headers_t hdrs;
+    char filename[MAXLINE], cgiargs[MAXLINE];
+    int is_static, is_post;
+    char body[MAXBODY + 1];
+    long body_len, body_read;
+} conn_t;
+
+/* 활성 연결들의 pool */
+typedef struct {
+    int maxfd;                                    /* read_set에서 가장 큰 fd (select 범위) */
+    fd_set read_set;                              /* 감시할 fd 목록 (원본) */
+    fd_set ready_set;                             /* 이번 회차에 준비된 fd */
+    int nready;                                   /* 이번 회차에 준비된 fd 개수 */
+    int maxi;                                     /* clientfd[]에서 사용 중인 마지막 칸 */
+    int clientfd[FD_SETSIZE];                     /* -1이면 빈칸 */
+    conn_t conns[FD_SETSIZE];                     /* 칸마다 연결 상태 */
+} pool;
+
+/* ===== 함수 선언 ===== */
+
+/* 이벤트 루프 / pool */
+void init_pool(int listenfd, pool *p);
+void add_client(int connfd, pool *p);
+void check_clients(pool *p);
+void command(void);
+
+/* 연결별 상태 기계 */
+int handle_client(int fd, conn_t *c);
+int on_request_line(int fd, conn_t *c, char *buf);
+int on_header_line(int fd, conn_t *c, char *buf);
+int on_body(int fd, conn_t *c);
+void respond(int fd, conn_t *c);
+ssize_t rio_read_some(rio_t *rp, char *usrbuf, size_t n);
+
+/* 응답 */
 int parse_uri(char *uri, char *filename, char *cgiargs);
 void serve_static(int fd, char *filename, int filesize);
 void get_filetype(char *filename, char *filetype);
@@ -9,21 +53,8 @@ void serve_dynamic(int fd, char *filename, char *cgiargs,
                    char *method, char *body, long body_len);
 void clienterror(int fd, char *cause, char *errnum,
                  char *shortmsg, char *longmsg, char *allow);
-void command(void);
 
-typedef struct {
-    int maxfd;
-    fd_set read_set;
-    fd_set ready_set;
-    int nready;
-    int maxi;
-    int clientfd[FD_SETSIZE];
-    rio_t clientrio[FD_SETSIZE];
-} pool;
-
-void init_pool(int listenfd, pool *p);
-void add_client(int connfd, pool *p);
-void check_clients(pool *p);
+/* ===== 이벤트 루프 ===== */
 
 int main(int argc, char **argv)
 {
@@ -31,13 +62,14 @@ int main(int argc, char **argv)
     socklen_t clientlen;
     struct sockaddr_storage clientaddr;
     char client_hostname[MAXLINE], client_port[MAXLINE];
-    static pool pool;
+    static pool pool;                             /* 크기가 커서 스택이 아닌 static에 둔다 */
 
     if (argc != 2) {
         fprintf(stderr, "usage: %s <port>\n", argv[0]);
         exit(0);
     }
 
+    /* CGI가 body를 다 읽기 전에 끝나도 pipe 쓰기에서 서버가 죽지 않게 한다 */
     Signal(SIGPIPE, SIG_IGN);
 
     listenfd = Open_listenfd(argv[1]);
@@ -45,7 +77,8 @@ int main(int argc, char **argv)
 
     while (1) {
         pool.ready_set = pool.read_set;
-        pool.nready = Select(pool.maxfd+1, &pool.ready_set, NULL, NULL, NULL); // 준비된 fd 개수 기록, check_client에서 사용
+        /* 준비된 fd 개수. add_client, check_clients에서 하나씩 차감 */
+        pool.nready = Select(pool.maxfd + 1, &pool.ready_set, NULL, NULL, NULL);
 
         if (FD_ISSET(STDIN_FILENO, &pool.ready_set)) {
             pool.nready--;
@@ -54,7 +87,8 @@ int main(int argc, char **argv)
         if (FD_ISSET(listenfd, &pool.ready_set)) {
             clientlen = sizeof(struct sockaddr_storage);
             connfd = Accept(listenfd, (SA *)&clientaddr, &clientlen);
-            Getnameinfo((SA *) &clientaddr, clientlen, client_hostname, MAXLINE, client_port, MAXLINE, 0);
+            Getnameinfo((SA *)&clientaddr, clientlen, client_hostname, MAXLINE,
+                        client_port, MAXLINE, 0);
             printf("Accepted connection from (%s, %s)\n", client_hostname, client_port);
             add_client(connfd, &pool);
         }
@@ -62,180 +96,249 @@ int main(int argc, char **argv)
     }
 }
 
-/* 활성 클라이언트로 pool 초기화 */
+/* pool 초기화: 처음에는 listenfd와 stdin만 감시 */
 void init_pool(int listenfd, pool *p)
 {
     int i;
-    p->maxi = -1; // check_clients에서 사용
-    for (i=0; i< FD_SETSIZE; i++)
-        p->clientfd[i] = -1; 
 
-    p->maxfd = listenfd; // 감시 할 가장 큰 fd 번호, select에 전달
+    p->maxi = -1;                                 /* 아직 사용 중인 칸 없음 */
+    for (i = 0; i < FD_SETSIZE; i++)
+        p->clientfd[i] = -1;
+
+    p->maxfd = listenfd;
     FD_ZERO(&p->read_set);
     FD_SET(listenfd, &p->read_set);
     FD_SET(STDIN_FILENO, &p->read_set);
 }
 
-/* 새로운 클라이언트 연결을 pool에 추가하는 함수*/
+/* 새 연결을 빈칸에 등록. 처리는 다음 회차부터 */
 void add_client(int connfd, pool *p)
 {
     int i;
+
     p->nready--;
-    for (i = 0; i < FD_SETSIZE; i++) { // 이용 가능한 슬롯 찾기
+    for (i = 0; i < FD_SETSIZE; i++) {
         if (p->clientfd[i] < 0) {
+            conn_t *c = &p->conns[i];
+
             p->clientfd[i] = connfd;
-            Rio_readinitb(&p->clientrio[i], connfd);
+            memset(c, 0, sizeof(*c));             /* 이전 연결이 남긴 값 지우기 */
+            Rio_readinitb(&c->rio, connfd);
+            c->state = READ_REQLINE;
 
             FD_SET(connfd, &p->read_set);
-
             if (connfd > p->maxfd)
                 p->maxfd = connfd;
             if (i > p->maxi)
                 p->maxi = i;
-            break;
+            return;
         }
     }
-    if (i == FD_SETSIZE)
-        app_error("add_client error: Too many clients");
+    Close(connfd);                                /* 빈칸 없음: 이 연결만 거절 */
 }
 
-/* 준비된 클라이언트 연결에 대해 요청을 처리하는 함수 */
+/* 준비된 연결마다 상태 기계를 한 단계 이상 진행. 끝난 연결은 정리 */
 void check_clients(pool *p)
 {
-    int i, connfd, n;
-    char buf[MAXLINE];
-    rio_t rio;
+    int i, connfd;
 
     for (i = 0; (i <= p->maxi) && (p->nready > 0); i++) {
         connfd = p->clientfd[i];
-        rio = p->clientrio[i];
-
-        if ((connfd > 0) && (FD_ISSET(connfd, &p->ready_set))) {
+        if ((connfd >= 0) && FD_ISSET(connfd, &p->ready_set)) {
             p->nready--;
-            doit(connfd);
-            Close(connfd);
-            FD_CLR(connfd, &p->read_set);
-            p->clientfd[i] = -1;
+            if (handle_client(connfd, &p->conns[i]) == CLOSE) {
+                Close(connfd);
+                FD_CLR(connfd, &p->read_set);
+                p->clientfd[i] = -1;
+            }
         }
     }
 }
 
-void command(void) {
+/* 서버 터미널 입력 처리. Ctrl+D면 종료 */
+void command(void)
+{
     char buf[MAXLINE];
+
     if (!Fgets(buf, MAXLINE, stdin))
         exit(0);
     printf("%s", buf);
 }
 
-void doit(int fd)
+/* ===== 연결별 상태 기계 ===== */
+
+/* 지금 읽을 수 있는 만큼 진행. 요청이 덜 왔으면 KEEP, 끝났으면 CLOSE */
+int handle_client(int fd, conn_t *c)
 {
-    int is_static, is_post;
-    struct stat sbuf;
-    char body[MAXBODY + 1];
-    long body_len;
-    ssize_t n;
-    char buf[MAXLINE], method[MAXLINE], uri[MAXLINE], version[MAXLINE];
-    char filename[MAXLINE], cgiargs[MAXLINE];
-    rio_t rio;
-    req_headers_t hdrs;
+    char buf[MAXLINE];
+    int ret;
 
-    Rio_readinitb(&rio, fd);
-    if (!Rio_readlineb(&rio, buf, MAXLINE))
-        return;
-    printf("Request headers:\n");
-    printf("%s", buf);
+    do {
+        if (c->state == READ_BODY) {
+            ret = on_body(fd, c);
+        } else {
+            if (rio_readlineb(&c->rio, buf, MAXLINE) <= 0)
+                return CLOSE;                     /* EOF / 에러 */
+            if (c->state == READ_REQLINE)
+                ret = on_request_line(fd, c, buf);
+            else
+                ret = on_header_line(fd, c, buf);
+        }
+        if (ret == CLOSE)
+            return CLOSE;
+    } while (c->rio.rio_cnt > 0);                 /* rio 버퍼에 남은 데이터는 지금 처리 */
 
-    sscanf(buf, "%s %s %s", method, uri, version);
-    printf("method=[%s] uri=[%s] version=[%s]\n", method, uri, version);
+    return KEEP;                                  /* 덜 왔음 → select로 복귀 */
+}
 
-    is_post = !strcasecmp(method, "POST");
-    if (strcasecmp(method, "GET") && !is_post) {
-        clienterror(fd, method, "501", "Not implemented", "Tiny does not implement this method", NULL);
-        return;
+/* READ_REQLINE: 요청 줄 파싱 */
+int on_request_line(int fd, conn_t *c, char *buf)
+{
+    printf("Request headers:\n%s", buf);
+    sscanf(buf, "%s %s %s", c->method, c->uri, c->version);
+    printf("method=[%s] uri=[%s] version=[%s]\n", c->method, c->uri, c->version);
+
+    c->is_post = !strcasecmp(c->method, "POST");
+    if (strcasecmp(c->method, "GET") && !c->is_post) {
+        clienterror(fd, c->method, "501", "Not implemented",
+                    "Tiny does not implement this method", NULL);
+        return CLOSE;
+    }
+    c->state = READ_HEADERS;
+    return KEEP;
+}
+
+/* READ_HEADERS: 헤더 한 줄 저장. 빈 줄이면 요청 검사 후 body 대기 또는 응답 */
+int on_header_line(int fd, conn_t *c, char *buf)
+{
+    if (strcmp(buf, "\r\n") && strcmp(buf, "\n")) {
+        if (parse_header_line(buf, &c->hdrs) < 0) {
+            clienterror(fd, "header", "400", "Bad Request",
+                        "Tiny couldn't parse the request headers", NULL);
+            return CLOSE;
+        }
+        return KEEP;
     }
 
-    if (read_requesthdrs(&rio, &hdrs) < 0) {
-        clienterror(fd, "header", "400", "Bad Request", "Tiny couldn't parse the request headers", NULL);
-        return;
-    }
-
-    is_static = parse_uri(uri, filename, cgiargs);
+    c->is_static = parse_uri(c->uri, c->filename, c->cgiargs);
 
     /* 405: 정적 파일 경로(예: /home.html)로 POST 요청이 오는 경우 */
-    if (is_post && is_static) {
-        clienterror(fd, filename, "405", "Method Not Allowed",
+    if (c->is_post && c->is_static) {
+        clienterror(fd, c->filename, "405", "Method Not Allowed",
                     "POST is not allowed for static content", "GET");
-        return;
+        return CLOSE;
     }
 
     /* 411: POST인데 Content-Length가 없는 경우 */
-    if (is_post && !hdrs.has_content_length) {
+    if (c->is_post && !c->hdrs.has_content_length) {
         clienterror(fd, "body", "411", "Length Required",
                     "POST request requires Content-Length", NULL);
-        return;
+        return CLOSE;
     }
 
-    body_len = hdrs.has_content_length ? hdrs.content_length : 0;
+    c->body_len = c->hdrs.has_content_length ? c->hdrs.content_length : 0;
 
     /* 413: body가 버퍼보다 큰 경우 */
-    if (body_len > MAXBODY) {
+    if (c->body_len > MAXBODY) {
         clienterror(fd, "body", "413", "Content Too Large",
                     "Request body is too large", NULL);
+        return CLOSE;
+    }
+
+    if (c->body_len > 0) {
+        c->state = READ_BODY;
+        return KEEP;
+    }
+    respond(fd, c);
+    return CLOSE;
+}
+
+/* READ_BODY: 받은 만큼 body 뒤에 이어 붙임. 다 받으면 응답 */
+int on_body(int fd, conn_t *c)
+{
+    ssize_t n = rio_read_some(&c->rio, c->body + c->body_read,
+                              c->body_len - c->body_read);
+
+    /* 400: 실제 body가 Content-Length보다 짧은 채로 연결이 끊긴 경우 */
+    if (n <= 0) {
+        clienterror(fd, "body", "400", "Bad Request",
+                    "Request body is shorter than Content-Length", NULL);
+        return CLOSE;
+    }
+    c->body_read += n;
+    if (c->body_read < c->body_len)
+        return KEEP;
+
+    c->body[c->body_len] = '\0';
+    respond(fd, c);
+    return CLOSE;
+}
+
+/* rio 버퍼에 있는 만큼, 비었으면 read 한 번만 해서 최대 n바이트 복사 */
+ssize_t rio_read_some(rio_t *rp, char *usrbuf, size_t n)
+{
+    size_t cnt;
+
+    if (rp->rio_cnt <= 0) {
+        rp->rio_cnt = read(rp->rio_fd, rp->rio_buf, sizeof(rp->rio_buf));
+        if (rp->rio_cnt <= 0)
+            return rp->rio_cnt;                   /* 0: EOF, -1: 에러 */
+        rp->rio_bufptr = rp->rio_buf;
+    }
+    cnt = (n < (size_t)rp->rio_cnt) ? n : (size_t)rp->rio_cnt;
+    memcpy(usrbuf, rp->rio_bufptr, cnt);
+    rp->rio_bufptr += cnt;
+    rp->rio_cnt -= cnt;
+    return cnt;
+}
+
+/* 요청을 다 받은 뒤 파일 확인 후 정적/동적 응답 */
+void respond(int fd, conn_t *c)
+{
+    struct stat sbuf;
+
+    if (stat(c->filename, &sbuf) < 0) {
+        clienterror(fd, c->filename, "404", "Not found",
+                    "Tiny couldn't find this file", NULL);
         return;
     }
 
-    /* body 읽기 + 400: 실제 body가 Content-Length보다 짧은 경우 */
-    if (body_len > 0) {
-        n = Rio_readnb(&rio, body, body_len);
-        if (n != body_len) {
-            clienterror(fd, "body", "400", "Bad Request",
-                        "Request body is shorter than Content-Length", NULL);
-            return;
-        }
-    }
-    body[body_len] = '\0';
-
-    if (stat(filename, &sbuf) < 0) {
-        clienterror(fd, filename, "404", "Not found", "Tiny couldn't find this file", NULL);
-        return;
-    }
-
-     if (is_static) {
+    if (c->is_static) {
         if (!(S_ISREG(sbuf.st_mode)) || !(S_IRUSR & sbuf.st_mode)) {
-            clienterror(fd, filename, "403", "Forbidden", "Tiny couldn't read this file", NULL);
+            clienterror(fd, c->filename, "403", "Forbidden",
+                        "Tiny couldn't read this file", NULL);
             return;
         }
-        serve_static(fd, filename, sbuf.st_size);
-    }
-    else {
+        serve_static(fd, c->filename, sbuf.st_size);
+    } else {
         if (!(S_ISREG(sbuf.st_mode)) || !(S_IXUSR & sbuf.st_mode)) {
-            clienterror(fd, filename, "403", "Forbidden", "Tiny couldn't run the CGI program", NULL);
+            clienterror(fd, c->filename, "403", "Forbidden",
+                        "Tiny couldn't run the CGI program", NULL);
             return;
         }
-        serve_dynamic(fd, filename, cgiargs, method, body, body_len);
+        serve_dynamic(fd, c->filename, c->cgiargs, c->method, c->body, c->body_len);
     }
 }
+
+/* ===== 응답 ===== */
 
 int parse_uri(char *uri, char *filename, char *cgiargs)
 {
     char *ptr;
 
-     if (!strstr(uri, "cgi-bin")) {
+    if (!strstr(uri, "cgi-bin")) {
         strcpy(cgiargs, "");
         strcpy(filename, ".");
         strcat(filename, uri);
-        if (uri[strlen(uri)-1] == '/')
+        if (uri[strlen(uri) - 1] == '/')
             strcat(filename, "home.html");
         return 1;
-     }
-
-    else {
+    } else {
         ptr = index(uri, '?');
         if (ptr) {
-            strcpy(cgiargs, ptr+1);
+            strcpy(cgiargs, ptr + 1);
             *ptr = '\0';
-        }
-        else
+        } else
             strcpy(cgiargs, "");
         strcpy(filename, ".");
         strcat(filename, uri);
@@ -278,13 +381,12 @@ static const struct { const char *ext; const char *type; } mime_table[] = {
     { NULL,   NULL }
 };
 
-
 void get_filetype(char *filename, char *filetype)
 {
     char *dot = strrchr(filename, '.');
     char *slash = strrchr(filename, '/');
 
-    /* 마지막 '.'이 파일명 부분에 있을 때 mime 테이블 매핑: ./home.html, */
+    /* 마지막 '.'이 파일명 부분에 있을 때 mime 테이블 매핑: ./home.html */
     if (dot && (!slash || dot > slash)) {
         for (int i = 0; mime_table[i].ext; i++) {
             if (!strcasecmp(dot + 1, mime_table[i].ext)) {
@@ -314,7 +416,7 @@ void serve_dynamic(int fd, char *filename, char *cgiargs,
     sprintf(buf, "Server: Tiny Web Server\r\n");
     Rio_writen(fd, buf, strlen(buf));
 
-    if (Fork() == 0) {                       /* 자식 */
+    if (Fork() == 0) {                            /* 자식 */
         close(p[1]);
         setenv("REQUEST_METHOD", method, 1);
         setenv("QUERY_STRING", cgiargs, 1);
@@ -322,17 +424,17 @@ void serve_dynamic(int fd, char *filename, char *cgiargs,
             snprintf(lenbuf, sizeof(lenbuf), "%ld", body_len);
             setenv("CONTENT_LENGTH", lenbuf, 1);
         }
-        dup2(p[0], STDIN_FILENO);            /* 읽기 끝 → stdin */
+        dup2(p[0], STDIN_FILENO);                 /* 읽기 끝 → stdin */
         close(p[0]);
-        dup2(fd, STDOUT_FILENO);             /* stdout → 클라이언트 */
+        dup2(fd, STDOUT_FILENO);                  /* stdout → 클라이언트 */
         execve(filename, emptylist, environ);
-        exit(1);
+        _exit(1);                                 /* stdio 버퍼를 클라이언트로 흘리지 않게 */
     }
 
-    close(p[0]);                             /* 부모 */
+    close(p[0]);                                  /* 부모 */
     if (body_len > 0)
-        rio_writen(p[1], body, body_len);    /* 실패해도 서버가 죽지 않게 소문자 버전 사용 */
-    close(p[1]);                             /* 자식에게 EOF 전달 */
+        rio_writen(p[1], body, body_len);         /* 실패해도 서버가 죽지 않게 소문자 버전 사용 */
+    close(p[1]);                                  /* 자식에게 EOF 전달 */
     Wait(NULL);
 }
 
@@ -350,7 +452,7 @@ void clienterror(int fd, char *cause, char *errnum,
 
     sprintf(buf, "HTTP/1.0 %s %s\r\n", errnum, shortmsg);
     Rio_writen(fd, buf, strlen(buf));
-    if (allow != NULL) {                     /* 405일 때만 "GET" 전달 */
+    if (allow != NULL) {                          /* 405일 때만 "GET" 전달 */
         sprintf(buf, "Allow: %s\r\n", allow);
         Rio_writen(fd, buf, strlen(buf));
     }
