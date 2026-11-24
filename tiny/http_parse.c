@@ -35,7 +35,7 @@ int parse_content_length(const char *v, long *out)
 int parse_header_line(char *buf, req_headers_t *h)
 {
     char *colon, *name, *value;
-    ssize_t n;
+    size_t n = strlen(buf);
     long len;
 
     if (n == 0 || buf[n - 1] != '\n')          /* MAXLINE보다 긴 줄은 잘려서 \n이 없다 */
