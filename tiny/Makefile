@@ -32,6 +32,15 @@ test-adder: cgi
 test-server: tiny cgi
 	bash tests/test_server.sh
 
+route.o: route.c route.h
+	$(CC) $(CFLAGS) -c route.c
+
+tests/test_route: tests/test_route.c route.o
+	$(CC) $(CFLAGS) -o $@ tests/test_route.c route.o
+
+test-route: tests/test_route
+	./tests/test_route
+
 .PHONY: all cgi clean test test-unit test-adder test-server
 
 clean:
