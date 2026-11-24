@@ -176,17 +176,35 @@ void serve_static(int fd, char *filename, int filesize)
     Munmap(srcp, filesize);
 }
 
+static const struct { const char *ext; const char *type; } mime_table[] = {
+    { "html", "text/html; charset=utf-8" },
+    { "htm",  "text/html; charset=utf-8" },
+    { "css",  "text/css; charset=utf-8" },
+    { "js",   "text/javascript; charset=utf-8" },
+    { "png",  "image/png" },
+    { "jpg",  "image/jpeg" },
+    { "jpeg", "image/jpeg" },
+    { "gif",  "image/gif" },
+    { "txt",  "text/plain; charset=utf-8" },
+    { NULL,   NULL }
+};
+
+
 void get_filetype(char *filename, char *filetype)
 {
+    char *dot = strrchr(filename, '.');
+    char *slash = strrchr(filename, '/');
 
-    if (strstr(filename, ".html"))
-        strcpy(filetype, "text/html; charset=utf-8");
-    else if (strstr(filename, ".gif"))
-        strcpy(filetype, "image/gif");
-    else if (strstr(filename, ".jpg"))
-        strcpy(filetype, "image/jpeg");
-    else
-        strcpy(filetype, "text/plain");
+    /* 마지막 '.'이 파일명 부분에 있을 때 mime 테이블 매핑: ./home.html, */
+    if (dot && (!slash || dot > slash)) {
+        for (int i = 0; mime_table[i].ext; i++) {
+            if (!strcasecmp(dot + 1, mime_table[i].ext)) {
+                strcpy(filetype, mime_table[i].type);
+                return;
+            }
+        }
+    }
+    strcpy(filetype, "application/octet-stream");
 }
 
 void serve_dynamic(int fd, char *filename, char *cgiargs,
@@ -247,7 +265,7 @@ void clienterror(int fd, char *cause, char *errnum,
         sprintf(buf, "Allow: %s\r\n", allow);
         Rio_writen(fd, buf, strlen(buf));
     }
-    sprintf(buf, "Content-type: text/html\r\n");
+    sprintf(buf, "Content-type: text/html; charset=utf-8\r\n");
     Rio_writen(fd, buf, strlen(buf));
     sprintf(buf, "Content-length: %d\r\n\r\n", len);
     Rio_writen(fd, buf, strlen(buf));
