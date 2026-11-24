@@ -170,6 +170,44 @@ else
     check TC-FN-11 200 "$code" "$(cat "$TMP/body")" "$SUCCESS_TEXT"
 fi
 
+# ---------- 동시성 (스레드 풀) ----------
+
+# TC-CC-01: 요청을 끝내지 않고 붙잡고 있는 클라이언트가 있어도 다른 요청은 바로 응답
+# 반복형 서버라면 첫 연결을 처리하느라 두 번째 요청이 타임아웃난다.
+python3 -c '
+import socket, sys, time
+s = socket.create_connection(("localhost", int(sys.argv[1])))
+s.sendall(b"GET /home.html HTTP/1.0\r\n")    # 빈 줄을 보내지 않아 요청이 끝나지 않음
+time.sleep(3)
+' "$PORT" &
+SLOW_PID=$!
+sleep 0.3                                     # 느린 연결이 먼저 worker에 잡히도록
+code=$(curl -s --max-time 2 -o /dev/null -w '%{http_code}' "$BASE/home.html")
+check TC-CC-01 200 "$code"
+kill "$SLOW_PID" 2>/dev/null
+wait "$SLOW_PID" 2>/dev/null
+
+# TC-CC-02: CGI 요청 20개를 동시에 보내도 응답이 섞이지 않고 모두 자기 결과를 받는다
+cc_pids=()
+for k in $(seq 1 20); do
+    curl -s --max-time 10 -o "$TMP/cc_body_$k" -w '%{http_code}' \
+        "$BASE/cgi-bin/adder?num1=$k&num2=100" >"$TMP/cc_code_$k" &
+    cc_pids+=($!)
+done
+wait "${cc_pids[@]}"                          # 그냥 wait하면 백그라운드 서버까지 기다린다
+cc_ok=1
+cc_why=""
+for k in $(seq 1 20); do
+    c=$(cat "$TMP/cc_code_$k")
+    expected="$k + 100 = $((k + 100))"
+    if [ "$c" != 200 ]; then
+        cc_ok=0; cc_why="요청 $k: status $c"; break
+    elif ! grep -qF "$expected" "$TMP/cc_body_$k"; then
+        cc_ok=0; cc_why="요청 $k: 본문에 '$expected'가 없음"; break
+    fi
+done
+report TC-CC-02 "$cc_ok" "$cc_why"
+
 # 모든 요청 후에도 서버가 살아 있어야 한다 (SIGPIPE 등으로 죽지 않았는지)
 if ! kill -0 "$SERVER_PID" 2>/dev/null; then
     echo "[FAIL] 서버 프로세스가 테스트 중 종료됨" >&2
