@@ -1,6 +1,14 @@
 #include "csapp.h"
 #include "http_parse.h"
 
+static volatile sig_atomic_t stop = 0;
+
+static void on_signal(int sig)
+{
+    (void)sig;
+    stop = 1;              /* 핸들러에서는 플래그만 세운다 */
+}
+
 /* ===== 연결 상태 ===== */
 
 enum { READ_REQLINE, READ_HEADERS, READ_BODY };   /* 요청을 어디까지 받았는지 */
@@ -71,19 +79,23 @@ int main(int argc, char **argv)
 
     /* CGI가 body를 다 읽기 전에 끝나도 pipe 쓰기에서 서버가 죽지 않게 한다 */
     Signal(SIGPIPE, SIG_IGN);
+    Signal(SIGINT, on_signal);
+    Signal(SIGTERM, on_signal);
 
     listenfd = Open_listenfd(argv[1]);
     init_pool(listenfd, &pool);
 
-    while (1) {
+    while (!stop) {
         pool.ready_set = pool.read_set;
         /* 준비된 fd 개수. add_client, check_clients에서 하나씩 차감 */
-        pool.nready = Select(pool.maxfd + 1, &pool.ready_set, NULL, NULL, NULL);
-
-        if (FD_ISSET(STDIN_FILENO, &pool.ready_set)) {
-            pool.nready--;
-            command();
+        pool.nready = select(pool.maxfd + 1, &pool.ready_set, NULL, NULL, NULL);
+        if (pool.nready < 0) {
+            if (errno == EINTR)
+                continue;          /* 시그널로 깨어남 → stop 확인하러 감 */
+            perror("select");
+            break;
         }
+
         if (FD_ISSET(listenfd, &pool.ready_set)) {
             clientlen = sizeof(struct sockaddr_storage);
             connfd = Accept(listenfd, (SA *)&clientaddr, &clientlen);
@@ -94,6 +106,14 @@ int main(int argc, char **argv)
         }
         check_clients(&pool);
     }
+
+    for (int i = 0; i <= pool.maxi; i++)
+    if (pool.clientfd[i] >= 0)
+        Close(pool.clientfd[i]);
+    Close(listenfd);
+    printf("server stopped\n");
+    
+    return 0;
 }
 
 /* pool 초기화: 처음에는 listenfd와 stdin만 감시 */
@@ -108,7 +128,6 @@ void init_pool(int listenfd, pool *p)
     p->maxfd = listenfd;
     FD_ZERO(&p->read_set);
     FD_SET(listenfd, &p->read_set);
-    FD_SET(STDIN_FILENO, &p->read_set);
 }
 
 /* 새 연결을 빈칸에 등록. 처리는 다음 회차부터 */
@@ -153,16 +172,6 @@ void check_clients(pool *p)
             }
         }
     }
-}
-
-/* 서버 터미널 입력 처리. Ctrl+D면 종료 */
-void command(void)
-{
-    char buf[MAXLINE];
-
-    if (!Fgets(buf, MAXLINE, stdin))
-        exit(0);
-    printf("%s", buf);
 }
 
 /* ===== 연결별 상태 기계 ===== */
