@@ -27,6 +27,10 @@ typedef struct {
     int is_static, is_post;
     char body[MAXBODY + 1];
     long body_len, body_read;
+    char hdr_raw[MAXBUF];          /* 백엔드로 넘길 헤더 원본 */
+    size_t hdr_len;
+    char client_ip[NI_MAXHOST];    /* X-Forwarded-For 용 */
+    route_t *route;                /* 매칭된 규칙, 없으면 NULL */
 } conn_t;
 
 /* 활성 연결들의 pool */
@@ -42,9 +46,14 @@ typedef struct {
 
 /* ===== 함수 선언 ===== */
 
+int save_header(conn_t *c, const char *line);
+int is_hop_by_hop(const char *name, size_t len);
+void finish_request(int fd, conn_t *c);
+void proxy_stub(int fd, conn_t *c);
+
 /* 이벤트 루프 / pool */
 void init_pool(int listenfd, pool *p);
-void add_client(int connfd, pool *p);
+void add_client(int connfd, pool *p, const char *client_ip);
 void check_clients(pool *p);
 void command(void);
 
@@ -109,9 +118,9 @@ int main(int argc, char **argv)
             clientlen = sizeof(struct sockaddr_storage);
             connfd = Accept(listenfd, (SA *)&clientaddr, &clientlen);
             Getnameinfo((SA *)&clientaddr, clientlen, client_hostname, MAXLINE,
-                        client_port, MAXLINE, 0);
+                        client_port, MAXLINE, NI_NUMERICHOST | NI_NUMERICSERV);
             printf("Accepted connection from (%s, %s)\n", client_hostname, client_port);
-            add_client(connfd, &pool);
+            add_client(connfd, &pool, client_hostname);
         }
         check_clients(&pool);
     }
@@ -140,7 +149,7 @@ void init_pool(int listenfd, pool *p)
 }
 
 /* 새 연결을 빈칸에 등록. 처리는 다음 회차부터 */
-void add_client(int connfd, pool *p)
+void add_client(int connfd, pool *p, const char *client_ip)
 {
     int i;
 
@@ -151,6 +160,7 @@ void add_client(int connfd, pool *p)
 
             p->clientfd[i] = connfd;
             memset(c, 0, sizeof(*c));             /* 이전 연결이 남긴 값 지우기 */
+            snprintf(c->client_ip, sizeof(c->client_ip), "%s", client_ip);
             Rio_readinitb(&c->rio, connfd);
             c->state = READ_REQLINE;
 
@@ -230,18 +240,20 @@ int on_request_line(int fd, conn_t *c, char *buf)
 int on_header_line(int fd, conn_t *c, char *buf)
 {
     if (strcmp(buf, "\r\n") && strcmp(buf, "\n")) {
-        if (parse_header_line(buf, &c->hdrs) < 0) {
-            clienterror(fd, "header", "400", "Bad Request",
+        if (save_header(c, buf) < 0 || parse_header_line(buf, &c->hdrs) < 0) {
+                clienterror(fd, "header", "400", "Bad Request",
                         "Tiny couldn't parse the request headers", NULL);
             return CLOSE;
         }
         return KEEP;
     }
 
-    c->is_static = parse_uri(c->uri, c->filename, c->cgiargs);
+    c->route = route_match(&routes, c->uri);     /* 405 검사보다 먼저 */
+    if (!c->route)
+        c->is_static = parse_uri(c->uri, c->filename, c->cgiargs);
 
     /* 405: 정적 파일 경로(예: /home.html)로 POST 요청이 오는 경우 */
-    if (c->is_post && c->is_static) {
+    if (!c->route && c->is_post && c->is_static) {
         clienterror(fd, c->filename, "405", "Method Not Allowed",
                     "POST is not allowed for static content", "GET");
         return CLOSE;
@@ -267,7 +279,7 @@ int on_header_line(int fd, conn_t *c, char *buf)
         c->state = READ_BODY;
         return KEEP;
     }
-    respond(fd, c);
+    finish_request(fd, c);
     return CLOSE;
 }
 
@@ -288,7 +300,7 @@ int on_body(int fd, conn_t *c)
         return KEEP;
 
     c->body[c->body_len] = '\0';
-    respond(fd, c);
+    finish_request(fd, c);
     return CLOSE;
 }
 
@@ -308,6 +320,61 @@ ssize_t rio_read_some(rio_t *rp, char *usrbuf, size_t n)
     rp->rio_bufptr += cnt;
     rp->rio_cnt -= cnt;
     return cnt;
+}
+
+/* hop-by-hop 헤더: 이 연결에만 의미가 있어 백엔드로 넘기지 않는다 */
+int is_hop_by_hop(const char *name, size_t len)
+{
+    static const char *hop[] = { "Connection", "Keep-Alive", "Proxy-Connection",
+                                 "TE", "Trailer", "Upgrade", NULL };
+
+    for (int i = 0; hop[i]; i++)
+        if (strlen(hop[i]) == len && !strncasecmp(name, hop[i], len))
+            return 1;
+    return 0;
+}
+
+/* 헤더 한 줄을 hdr_raw 뒤에 붙인다. parse_header_line이 buf를 바꾸기 전에 호출 */
+int save_header(conn_t *c, const char *line)
+{
+    size_t n = strlen(line);
+    const char *colon = strchr(line, ':');
+
+    if (colon && is_hop_by_hop(line, colon - line))
+        return 0;                       /* 버리기만, 에러 아님 */
+    if (c->hdr_len + n >= sizeof(c->hdr_raw))
+        return -1;                      /* 헤더 전체가 너무 김 → 400 */
+    memcpy(c->hdr_raw + c->hdr_len, line, n + 1);
+    c->hdr_len += n;
+    return 0;
+}
+
+/* 요청을 다 받은 뒤: 규칙이 있으면 프록시, 없으면 직접 응답 */
+void finish_request(int fd, conn_t *c)
+{
+    if (c->route)
+        proxy_stub(fd, c);
+    else
+        respond(fd, c);
+}
+
+/* 2단계 임시: 어디로 보낼지만 출력하고 502. 4단계에서 실제 전달로 교체 */
+void proxy_stub(int fd, conn_t *c)
+{
+    char path[MAXLINE];
+    int i = route_pick(c->route);
+    backend_t *be = &c->route->be[i];
+
+    if (route_rewrite_path(c->route, c->uri, path, sizeof(path)) < 0) {
+        clienterror(fd, c->uri, "414", "URI Too Long",
+                    "Rewritten path is too long", NULL);
+        return;
+    }
+    printf("proxy %s %s -> %s:%s %s (from %s)\n", c->method, c->uri,
+           be->host, be->port, path, c->client_ip);
+    printf("forward headers:\n%s", c->hdr_raw);
+    clienterror(fd, c->uri, "502", "Bad Gateway",
+                "Proxy forwarding is not implemented yet", NULL);
 }
 
 /* 요청을 다 받은 뒤 파일 확인 후 정적/동적 응답 */
