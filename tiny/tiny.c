@@ -1,5 +1,6 @@
 #include "csapp.h"
 #include "http_parse.h"
+#include "route.h"
 
 static volatile sig_atomic_t stop = 0;
 
@@ -8,6 +9,8 @@ static void on_signal(int sig)
     (void)sig;
     stop = 1;              /* 핸들러에서는 플래그만 세운다 */
 }
+
+static route_table_t routes;
 
 /* ===== 연결 상태 ===== */
 
@@ -72,9 +75,15 @@ int main(int argc, char **argv)
     char client_hostname[MAXLINE], client_port[MAXLINE];
     static pool pool;                             /* 크기가 커서 스택이 아닌 static에 둔다 */
 
-    if (argc != 2) {
-        fprintf(stderr, "usage: %s <port>\n", argv[0]);
-        exit(0);
+    if (argc != 2 && !(argc == 4 && !strcmp(argv[2], "-c"))) {
+        fprintf(stderr, "usage: %s <port> [-c routes.conf]\n", argv[0]);
+        exit(1);
+    }
+
+    if (argc == 4) {
+        if (route_load(argv[3], &routes) < 0)
+            exit(1);                  /* 잘못된 설정이면 시작하지 않음 */
+        route_print(&routes);
     }
 
     /* CGI가 body를 다 읽기 전에 끝나도 pipe 쓰기에서 서버가 죽지 않게 한다 */
@@ -112,7 +121,7 @@ int main(int argc, char **argv)
         Close(pool.clientfd[i]);
     Close(listenfd);
     printf("server stopped\n");
-    
+
     return 0;
 }
 

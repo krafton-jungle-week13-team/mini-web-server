@@ -24,4 +24,8 @@ int route_pick(route_t *r);
 
 int route_rewrite_path(const route_t *r, const char *uri, char *out, size_t n);
 
+int route_load(const char *path, route_table_t *t);      /* 성공 0, 실패 -1 */
+
+void route_print(const route_table_t *t);
+
 #endif
