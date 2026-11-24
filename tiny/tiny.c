@@ -1,5 +1,8 @@
 #include "csapp.h"
 #include "http_parse.h"
+#ifdef __linux__
+#include <sys/syscall.h>
+#endif
 
 void doit(int fd);
 int parse_uri(char *uri, char *filename, char *cgiargs);
@@ -207,11 +210,38 @@ void get_filetype(char *filename, char *filetype)
     strcpy(filetype, "application/octet-stream");
 }
 
+/* CGI로 넘길 변수인지 확인한다 (서버 환경에 같은 이름이 있으면 요청 값으로 바꾸려고) */
+static int is_cgi_var(const char *kv)
+{
+    return !strncmp(kv, "REQUEST_METHOD=", 15) ||
+           !strncmp(kv, "QUERY_STRING=", 13) ||
+           !strncmp(kv, "CONTENT_LENGTH=", 15);
+}
+
+/* fork한 자식에서 3번 이상의 fd를 모두 닫는다.
+ * 다른 worker의 connfd·pipe까지 물려받기 때문에, 닫지 않으면
+ * 그 연결의 종료(EOF)가 이 CGI가 끝날 때까지 늦어진다. */
+static void close_inherited_fds(long maxfd)
+{
+    long i;
+
+#if defined(__linux__) && defined(SYS_close_range)
+    if (syscall(SYS_close_range, 3, ~0U, 0) == 0)
+        return;
+#endif
+    for (i = 3; i < maxfd; i++)
+        close(i);
+}
+
 void serve_dynamic(int fd, char *filename, char *cgiargs,
                    char *method, char *body, long body_len)
 {
-    int p[2];
-    char buf[MAXLINE], lenbuf[32], *emptylist[] = { NULL };
+    int p[2], i, n;
+    pid_t pid;
+    long maxfd;
+    char buf[MAXLINE], *emptylist[] = { NULL };
+    char method_env[MAXLINE + 32], query_env[MAXLINE + 32], length_env[64];
+    char **envp;
 
     /* pipe를 먼저 만든다. 상태줄(200)을 보낸 뒤에 실패하면 500을 보낼 수 없다. */
     if (pipe(p) < 0) {
@@ -220,31 +250,47 @@ void serve_dynamic(int fd, char *filename, char *cgiargs,
         return;
     }
 
+    /* 환경 변수 배열은 부모에서 미리 만든다.
+     * 여러 스레드가 있는 프로세스에서 fork한 자식은 exec 전에 setenv(내부 malloc)를 부르면
+     * 다른 스레드가 잡고 있던 락에 걸릴 수 있다. */
+    snprintf(method_env, sizeof(method_env), "REQUEST_METHOD=%s", method);
+    snprintf(query_env, sizeof(query_env), "QUERY_STRING=%s", cgiargs);
+    snprintf(length_env, sizeof(length_env), "CONTENT_LENGTH=%ld", body_len);
+    for (i = 0; environ[i]; i++)
+        ;
+    envp = Malloc((i + 4) * sizeof(char *));
+    for (i = 0, n = 0; environ[i]; i++)
+        if (!is_cgi_var(environ[i]))
+            envp[n++] = environ[i];
+    envp[n++] = method_env;
+    envp[n++] = query_env;
+    if (!strcasecmp(method, "POST"))
+        envp[n++] = length_env;
+    envp[n] = NULL;
+
+    maxfd = sysconf(_SC_OPEN_MAX);
+    if (maxfd < 0)
+        maxfd = 1024;
+
     sprintf(buf, "HTTP/1.0 200 OK\r\n");
     Rio_writen(fd, buf, strlen(buf));
     sprintf(buf, "Server: Tiny Web Server\r\n");
     Rio_writen(fd, buf, strlen(buf));
 
-    if (Fork() == 0) {                       /* 자식 */
-        close(p[1]);
-        setenv("REQUEST_METHOD", method, 1);
-        setenv("QUERY_STRING", cgiargs, 1);
-        if (!strcasecmp(method, "POST")) {
-            snprintf(lenbuf, sizeof(lenbuf), "%ld", body_len);
-            setenv("CONTENT_LENGTH", lenbuf, 1);
-        }
+    if ((pid = Fork()) == 0) {               /* 자식 */
         dup2(p[0], STDIN_FILENO);            /* 읽기 끝 → stdin */
-        close(p[0]);
         dup2(fd, STDOUT_FILENO);             /* stdout → 클라이언트 */
-        execve(filename, emptylist, environ);
-        exit(1);
+        close_inherited_fds(maxfd);          /* p[0], p[1], fd와 다른 연결의 fd까지 닫음 */
+        execve(filename, emptylist, envp);
+        _exit(1);                            /* exit는 부모에게서 복사된 printf 버퍼를 클라이언트로 내보낸다 */
     }
 
+    Free(envp);
     close(p[0]);                             /* 부모 */
     if (body_len > 0)
         rio_writen(p[1], body, body_len);    /* 실패해도 서버가 죽지 않게 소문자 버전 사용 */
     close(p[1]);                             /* 자식에게 EOF 전달 */
-    Wait(NULL);
+    Waitpid(pid, NULL, 0);                   /* wait는 다른 worker의 자식을 거둘 수 있다 */
 }
 
 void clienterror(int fd, char *cause, char *errnum,
