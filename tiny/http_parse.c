@@ -49,6 +49,15 @@ int read_requesthdrs(rio_t *rp, req_headers_t *h)
 
         printf("%s", buf);
 
+        /* 아래에서 buf를 고치기 전에 원문을 남긴다 */
+        if (h->raw_len + n < sizeof(h->raw)) {
+            memcpy(h->raw + h->raw_len, buf, n);
+            h->raw_len += n;
+            h->raw[h->raw_len] = '\0';
+        } else {
+            h->raw_overflow = 1;
+        }
+
         colon = strchr(buf, ':');
         if (colon == NULL || colon == buf ||
             colon[-1] == ' ' || colon[-1] == '\t')

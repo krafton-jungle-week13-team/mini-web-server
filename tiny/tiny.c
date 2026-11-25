@@ -1,6 +1,7 @@
 #include "csapp.h"
 #include "http_parse.h"
 #include "sbuf.h"
+#include "route.h"
 #ifdef __linux__
 #include <sys/syscall.h>
 #endif
@@ -15,8 +16,15 @@
 
 static sbuf_t sbuf;     /* main(생산자) → worker(소비자)로 connfd를 넘기는 버퍼 */
 
+/* 리버스 프록시 라우팅 규칙 (-c 설정 파일). main에서 한 번 읽고 이후에는 읽기만 한다.
+ * 단, route_pick은 라운드로빈 차례(rr)를 바꾸므로 rr_lock으로 감싼다. */
+static route_table_t routes;
+static pthread_mutex_t rr_lock = PTHREAD_MUTEX_INITIALIZER;
+
 void *worker(void *vargp);
 void doit(int fd);
+void proxy_request(int fd, route_t *rt, char *method, char *uri,
+                   req_headers_t *hdrs, char *body, long body_len);
 int parse_uri(char *uri, char *filename, char *cgiargs);
 void serve_static(int fd, char *filename, int filesize);
 void get_filetype(char *filename, char *filetype);
@@ -33,9 +41,14 @@ int main(int argc, char **argv)
     char client_hostname[MAXLINE], client_port[MAXLINE];
     pthread_t tid;
 
-    if (argc != 2) {
-        fprintf(stderr, "usage: %s <port>\n", argv[0]);
+    if (argc != 2 && !(argc == 4 && !strcmp(argv[2], "-c"))) {
+        fprintf(stderr, "usage: %s <port> [-c routes.conf]\n", argv[0]);
         exit(0);
+    }
+    if (argc == 4) {
+        if (route_load(argv[3], &routes) < 0)
+            exit(1);
+        route_print(&routes);
     }
 
     /* CGI가 body를 다 읽기 전에 끝나도 pipe 쓰기에서 서버가 죽지 않게 한다 */
@@ -74,6 +87,7 @@ void *worker(void *vargp)
 void doit(int fd)
 {
     int is_static, is_post;
+    route_t *rt;
     struct stat sbuf;
     char body[MAXBODY + 1];
     long body_len;
@@ -103,10 +117,12 @@ void doit(int fd)
         return;
     }
 
-    is_static = parse_uri(uri, filename, cgiargs);
+    /* 라우팅 규칙에 맞으면 백엔드로 전달한다. 맞는 규칙이 없으면 아래의 정적/CGI 처리. */
+    rt = route_match(&routes, uri);
+    is_static = rt ? 0 : parse_uri(uri, filename, cgiargs);
 
     /* 405: 정적 파일 경로(예: /home.html)로 POST 요청이 오는 경우 */
-    if (is_post && is_static) {
+    if (!rt && is_post && is_static) {
         clienterror(fd, filename, "405", "Method Not Allowed",
                     "POST is not allowed for static content", "GET");
         return;
@@ -138,6 +154,12 @@ void doit(int fd)
         }
     }
     body[body_len] = '\0';
+
+    /* 프록시 응답의 끝은 백엔드가 연결을 닫는 것으로 안다 */
+    if (rt) {
+        proxy_request(fd, rt, method, uri, &hdrs, body, body_len);
+        return;
+    }
 
     if (stat(filename, &sbuf) < 0) {
         clienterror(fd, filename, "404", "Not found", "Tiny couldn't find this file", NULL);
@@ -321,6 +343,160 @@ void serve_dynamic(int fd, char *filename, char *cgiargs,
         rio_writen(p[1], body, body_len);    /* 실패해도 서버가 죽지 않게 소문자 버전 사용 */
     close(p[1]);                             /* 자식에게 EOF 전달 */
     Waitpid(pid, NULL, 0);                   /* wait는 다른 worker의 자식을 거둘 수 있다 */
+}
+
+/* ---------- 리버스 프록시 ---------- */
+
+/* 이 연결에만 의미가 있는 헤더(hop-by-hop)는 백엔드로 넘기지 않는다 (RFC 9110 7.6.1) */
+static int is_hop_by_hop(const char *name, size_t len)
+{
+    static const char *hop[] = { "Connection", "Keep-Alive", "Proxy-Connection", "TE",
+                                 "Trailer", "Transfer-Encoding", "Upgrade", NULL };
+
+    for (int i = 0; hop[i]; i++)
+        if (strlen(hop[i]) == len && !strncasecmp(name, hop[i], len))
+            return 1;
+    return 0;
+}
+
+/* 백엔드에 연결한다. 성공하면 fd, 실패하면 -1.
+ * open_clientfd와 같지만 실패해도 서버를 끝내지 않는다 (Open_clientfd는 unix_error로 exit). */
+static int open_backend(const backend_t *be)
+{
+    struct addrinfo hints, *list, *p;
+    int fd = -1;
+
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = AI_NUMERICSERV;
+    if (getaddrinfo(be->host, be->port, &hints, &list) != 0)
+        return -1;
+    for (p = list; p; p = p->ai_next) {
+        if ((fd = socket(p->ai_family, p->ai_socktype, p->ai_protocol)) < 0)
+            continue;
+        if (connect(fd, p->ai_addr, p->ai_addrlen) == 0)
+            break;
+        close(fd);
+        fd = -1;
+    }
+    freeaddrinfo(list);
+    return fd;
+}
+
+/* dst에 src n바이트를 붙인다. 넘치면 -1 */
+static int append(char *dst, size_t cap, size_t *len, const char *src, size_t n)
+{
+    if (*len + n >= cap)
+        return -1;
+    memcpy(dst + *len, src, n);
+    *len += n;
+    dst[*len] = '\0';
+    return 0;
+}
+
+static ssize_t read_retry(int fd, char *buf, size_t n)
+{
+    ssize_t rc;
+
+    while ((rc = read(fd, buf, n)) < 0 && errno == EINTR)
+        ;
+    return rc;
+}
+
+/* 요청을 라우팅 규칙의 백엔드로 전달하고, 백엔드 응답을 그대로 클라이언트에 돌려준다.
+ * 백엔드에는 HTTP/1.0 + Connection: close로 보내서 응답의 끝을 연결 종료로 안다. */
+void proxy_request(int fd, route_t *rt, char *method, char *uri,
+                   req_headers_t *hdrs, char *body, long body_len)
+{
+    char path[MAXLINE], req[MAXLINE + MAXBUF + 2 * MAXLINE], buf[MAXBUF];
+    char client_ip[NI_MAXHOST], xff[MAXLINE], tmp[MAXLINE];
+    char *line, *next, *colon, *v;
+    struct sockaddr_storage peer;
+    socklen_t peerlen = sizeof(peer);
+    size_t len = 0, nlen;
+    ssize_t n;
+    backend_t *be;
+    int bfd, i;
+
+    if (hdrs->raw_overflow) {
+        clienterror(fd, "header", "431", "Request Header Fields Too Large",
+                    "Request headers are too large to forward", NULL);
+        return;
+    }
+    if (route_rewrite_path(rt, uri, path, sizeof(path)) < 0) {
+        clienterror(fd, uri, "414", "URI Too Long", "Rewritten path is too long", NULL);
+        return;
+    }
+
+    pthread_mutex_lock(&rr_lock);
+    i = route_pick(rt);
+    pthread_mutex_unlock(&rr_lock);
+    be = &rt->be[i];
+
+    if (getpeername(fd, (SA *)&peer, &peerlen) < 0 ||
+        getnameinfo((SA *)&peer, peerlen, client_ip, sizeof(client_ip), NULL, 0, NI_NUMERICHOST) != 0)
+        strcpy(client_ip, "unknown");
+    printf("Proxy %s %s -> %s:%s%s\n", method, uri, be->host, be->port, path);
+
+    /* 요청줄 + 클라이언트 헤더(hop-by-hop 제외) + Host(없으면) + X-Forwarded-For + Connection: close */
+    snprintf(req, sizeof(req), "%s %s HTTP/1.0\r\n", method, path);
+    len = strlen(req);
+    xff[0] = '\0';
+    for (line = hdrs->raw; *line; line = next) {
+        next = strchr(line, '\n');
+        next = next ? next + 1 : line + strlen(line);
+        colon = strchr(line, ':');               /* read_requesthdrs가 ':'가 있는 줄만 받음 */
+        nlen = colon - line;
+        if (is_hop_by_hop(line, nlen))
+            continue;
+        if (nlen == 15 && !strncasecmp(line, "X-Forwarded-For", 15)) {
+            /* 앞단 프록시가 붙인 값 뒤에 이번 클라이언트 IP를 덧붙인다 */
+            snprintf(tmp, sizeof(tmp), "%.*s", (int)(next - colon - 1), colon + 1);
+            v = trim(tmp);
+            if (*v)
+                snprintf(xff + strlen(xff), sizeof(xff) - strlen(xff), "%s, ", v);
+            continue;
+        }
+        if (append(req, sizeof(req), &len, line, next - line) < 0)
+            break;
+    }
+    if (!hdrs->has_host) {
+        snprintf(tmp, sizeof(tmp), "Host: %s:%s\r\n", be->host, be->port);
+        append(req, sizeof(req), &len, tmp, strlen(tmp));
+    }
+    snprintf(tmp, sizeof(tmp), "X-Forwarded-For: %s%s\r\nConnection: close\r\n\r\n", xff, client_ip);
+    if (append(req, sizeof(req), &len, tmp, strlen(tmp)) < 0) {
+        clienterror(fd, "header", "431", "Request Header Fields Too Large",
+                    "Request headers are too large to forward", NULL);
+        return;
+    }
+
+    if ((bfd = open_backend(be)) < 0) {
+        clienterror(fd, uri, "502", "Bad Gateway", "Tiny couldn't connect to the backend", NULL);
+        return;
+    }
+
+    if (rio_writen(bfd, req, len) != (ssize_t)len ||
+        (body_len > 0 && rio_writen(bfd, body, body_len) != body_len)) {
+        close(bfd);
+        clienterror(fd, uri, "502", "Bad Gateway", "Tiny couldn't send the request to the backend", NULL);
+        return;
+    }
+
+    /* 백엔드 응답은 시간 제한 없이 기다린다. 응답하지 않는 백엔드는 이 worker를 계속 붙잡는다.
+     * 첫 응답 바이트가 오기 전까지만 502를 보낼 수 있다.
+     * 그 뒤에 실패하면 이미 응답 일부가 나갔으므로 연결만 끊는다. */
+    n = read_retry(bfd, buf, sizeof(buf));
+    if (n <= 0) {
+        close(bfd);
+        clienterror(fd, uri, "502", "Bad Gateway", "The backend closed the connection without a response", NULL);
+        return;
+    }
+    do {
+        if (rio_writen(fd, buf, n) != n)         /* 클라이언트가 떠남 */
+            break;
+    } while ((n = read_retry(bfd, buf, sizeof(buf))) > 0);
+    close(bfd);
 }
 
 void clienterror(int fd, char *cause, char *errnum,

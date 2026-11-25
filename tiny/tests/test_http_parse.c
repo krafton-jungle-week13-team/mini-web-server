@@ -181,11 +181,43 @@ static void test_read_requesthdrs(void)
     }
 }
 
+/* ---------- 헤더 원문 보존 (docs/design/phase5/reverse-proxy.md) ---------- */
+
+static void test_raw_headers(void)
+{
+    req_headers_t h;
+    const char *raw = "Host:  a \r\nX-Test: 1\r\n\r\n";
+    int rc = run_hdrs(raw, strlen(raw), &h);
+
+    CHECK("TC-RAW-01", rc == 0 && !strcmp(h.raw, "Host:  a \r\nX-Test: 1\r\n") &&
+                       h.raw_len == strlen("Host:  a \r\nX-Test: 1\r\n") && !h.raw_overflow,
+          "rc=%d raw=\"%.64s\" len=%zu overflow=%d", rc, h.raw, h.raw_len, h.raw_overflow);
+
+    /* 줄 하나는 MAXLINE보다 짧지만 합치면 MAXBUF를 넘는 헤더: 파싱은 성공, raw_overflow 표시 */
+    {
+        size_t line = 4000, k, total = 3 * (line + 2) + 2;
+        char *big = malloc(total + 1), *p = big;
+
+        for (k = 0; k < 3; k++) {
+            p += sprintf(p, "X-%zu: ", k);
+            memset(p, 'a', line - 5);
+            p += line - 5;
+            p += sprintf(p, "\r\n");
+        }
+        p += sprintf(p, "\r\n");
+        rc = run_hdrs(big, p - big, &h);
+        CHECK("TC-RAW-02", rc == 0 && h.raw_overflow == 1 && h.raw_len < MAXBUF,
+              "rc=%d overflow=%d len=%zu", rc, h.raw_overflow, h.raw_len);
+        free(big);
+    }
+}
+
 int main(void)
 {
     test_parse_content_length();
     test_trim();
     test_read_requesthdrs();
+    test_raw_headers();
 
     fprintf(stderr, "\nheader parser: %d passed, %d failed\n", passes, failures);
     return failures ? 1 : 0;

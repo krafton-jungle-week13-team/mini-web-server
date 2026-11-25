@@ -3,3 +3,4 @@ tiny
 cgi-bin/adder
 *~
 tests/test_http_parse
+tests/test_route
