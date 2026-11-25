@@ -49,7 +49,7 @@ typedef struct {
 int save_header(conn_t *c, const char *line);
 int is_hop_by_hop(const char *name, size_t len);
 void finish_request(int fd, conn_t *c);
-void proxy_stub(int fd, conn_t *c);
+void proxy_forward(int fd, conn_t *c);
 
 /* 이벤트 루프 / pool */
 void init_pool(int listenfd, pool *p);
@@ -353,28 +353,91 @@ int save_header(conn_t *c, const char *line)
 void finish_request(int fd, conn_t *c)
 {
     if (c->route)
-        proxy_stub(fd, c);
+        proxy_forward(fd, c);
     else
         respond(fd, c);
 }
 
 /* 2단계 임시: 어디로 보낼지만 출력하고 502. 4단계에서 실제 전달로 교체 */
-void proxy_stub(int fd, conn_t *c)
+void proxy_forward(int fd, conn_t *c)
 {
-    char path[MAXLINE];
-    int i = route_pick(c->route);
-    backend_t *be = &c->route->be[i];
+    char path[MAXLINE], buf[MAXBUF];
+    route_t *r = c->route;
+    backend_t *be;
+    char *req;
+    size_t cap, len;
+    ssize_t n;
+    long relayed = 0;
+    int upfd;
 
+    /* 경로 검사 */
     if (route_rewrite_path(c->route, c->uri, path, sizeof(path)) < 0) {
         clienterror(fd, c->uri, "414", "URI Too Long",
                     "Rewritten path is too long", NULL);
         return;
     }
-    printf("proxy %s %s -> %s:%s %s (from %s)\n", c->method, c->uri,
-           be->host, be->port, path, c->client_ip);
-    printf("forward headers:\n%s", c->hdr_raw);
-    clienterror(fd, c->uri, "502", "Bad Gateway",
-                "Proxy forwarding is not implemented yet", NULL);
+    
+    /* 백엔드 선택 */
+    be = &r->be[route_pick(r)];
+
+    if ((upfd = open_clientfd(be->host, be->port)) < 0) {
+        fprintf(stderr, "proxy: connect %s:%s failed\n", be->host, be->port);
+        clienterror(fd, c->uri, "502", "Bad Gateway",
+                    "Could not connect to backend", NULL);
+        return;
+    }
+
+    /* 백엔드에 보낼 요청의 크기 */
+    cap = strlen(c->method) + strlen(path) + c->hdr_len
+      + strlen(c->client_ip) + c->body_len + 128;
+
+    /* 버퍼에 할당 후 쓰기 */
+    if ((req = malloc(cap)) == NULL) {
+        close(upfd);
+        clienterror(fd, c->uri, "500", "Internal Server Error",
+                    "Out of memory", NULL);
+        return;
+    }
+    len = snprintf(req, cap,
+                   "%s %s HTTP/1.0\r\n"
+                   "%s"
+                   "X-Forwarded-For: %s\r\n"
+                   "Connection: close\r\n"
+                   "\r\n",
+                   c->method, path, c->hdr_raw, c->client_ip);
+    memcpy(req + len, c->body, c->body_len);
+    len += c->body_len;
+
+    printf("proxy %s %s -> %s:%s %s\n", c->method, c->uri, be->host, be->port, path);
+
+    /* 백엔드에 전송 */
+    if (rio_writen(upfd, req, len) != (ssize_t)len) {
+        free(req);
+        close(upfd);
+        clienterror(fd, c->uri, "502", "Bad Gateway",
+                    "Failed to send request to backend", NULL);
+        return;
+    }
+    free(req);
+
+    /* 응답 중계 */
+    while (1) {
+        n = read(upfd, buf, sizeof(buf));
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n <= 0)
+            break;
+        if (rio_writen(fd, buf, n) != n)
+            break;                                /* 클라이언트가 끊음 */
+        relayed += n;
+    }
+    close(upfd);
+
+
+    /* 백엔드가 아무것도 안 보내고 닫았으면 502 */
+    if (relayed == 0)
+        clienterror(fd, c->uri, "502", "Bad Gateway",
+                    "Backend closed the connection without a response", NULL);
 }
 
 /* 요청을 다 받은 뒤 파일 확인 후 정적/동적 응답 */
