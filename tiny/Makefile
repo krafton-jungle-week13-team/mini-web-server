@@ -18,7 +18,7 @@ cgi:
 	(cd cgi-bin; make)
 
 # ---------- Phase 3 테스트 (docs/test/phase3/test-cases.md) ----------
-test: test-unit test-adder test-server
+test: test-unit test-adder test-server test-proxy      
 
 tests/test_http_parse: tests/test_http_parse.c http_parse.o csapp.o
 	$(CC) $(CFLAGS) -o $@ tests/test_http_parse.c http_parse.o csapp.o $(LIB)
@@ -31,6 +31,11 @@ test-adder: cgi
 
 test-server: tiny cgi
 	bash tests/test_server.sh
+
+test-proxy: tiny cgi                                  
+	bash tests/test_proxy.sh
+
+.PHONY: all cgi clean test test-unit test-adder test-server test-proxy
 
 route.o: route.c route.h
 	$(CC) $(CFLAGS) -c route.c
