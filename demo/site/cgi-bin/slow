@@ -1,0 +1,28 @@
+#!/bin/bash
+# 일부러 느린 CGI: /cgi-bin/slow?sec=N (기본 5초, 최대 30초)
+# 서버가 이 CGI를 wait로 기다리는 동안 다른 연결도 모두 멈추는지 확인하는 용도
+
+sec=5
+if [[ "$QUERY_STRING" =~ (^|&)sec=([0-9]+) ]]; then
+    sec=${BASH_REMATCH[2]}
+fi
+[ "$sec" -gt 30 ] && sec=30
+
+start=$(date '+%H:%M:%S')
+sleep "$sec"
+end=$(date '+%H:%M:%S')
+
+body="<!DOCTYPE html>
+<html lang=\"ko\"><head><meta charset=\"utf-8\"><title>느린 응답</title>
+<link rel=\"stylesheet\" href=\"/css/style.css\"></head>
+<body><main>
+<h1>${sec}초 기다렸어요</h1>
+<p>시작 $start → 끝 $end</p>
+<p>이 응답을 기다리는 동안 다른 탭의 요청도 멈췄다면, 서버가 CGI를 블로킹으로 처리하고 있는 거예요.</p>
+<p><a href=\"/lab.html\">서버 실험실로 돌아가기</a></p>
+</main></body></html>"
+
+printf 'Connection: close\r\n'
+printf 'Content-Type: text/html; charset=utf-8\r\n'
+printf 'Content-Length: %d\r\n\r\n' "$(printf '%s' "$body" | wc -c)"
+printf '%s' "$body"

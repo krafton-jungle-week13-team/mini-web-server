@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>모퉁이 커피</title>
+  <link rel="icon" href="/img/favicon.png">
+  <link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <a href="/" class="brand"><img src="/img/logo.png" alt="" width="40" height="40">모퉁이 커피</a>
+    <nav>
+      <a href="/">홈</a>
+      <a href="/cgi-bin/guestbook">방명록</a>
+      <a href="/lab.html" class="lab-link">서버 실험실</a>
+    </nav>
+  </header>
+
+  <section class="hero">
+    <img src="/img/cafe.jpg" alt="창가 자리와 커피 두 잔">
+    <div class="hero-text">
+      <h1>골목 모퉁이의 작은 로스터리</h1>
+      <p>매일 아침 직접 볶은 원두로 내립니다.</p>
+    </div>
+  </section>
+
+  <main>
+    <section>
+      <h2>대표 메뉴</h2>
+      <div class="cards">
+        <figure class="card"><img src="/img/americano.jpg" alt=""><figcaption>아메리카노<span>4,000원</span></figcaption></figure>
+        <figure class="card"><img src="/img/latte.jpg" alt=""><figcaption>카페 라떼<span>4,800원</span></figcaption></figure>
+        <figure class="card"><img src="/img/cake.jpg" alt=""><figcaption>딸기 케이크<span>6,500원</span></figcaption></figure>
+      </div>
+    </section>
+
+    <section>
+      <h2>오늘의 메뉴 <small>백엔드 서버에서 받아 옵니다</small></h2>
+      <div id="today" class="today">
+        <img src="/img/loading.gif" alt="" width="32" height="32"> 불러오는 중…
+      </div>
+      <button id="reload" type="button">다시 불러오기</button>
+      <p class="hint">새로 불러올 때마다 응답한 백엔드가 번갈아 바뀌면 라운드로빈이 동작하는 거예요.</p>
+    </section>
+
+    <section>
+      <h2>오시는 길</h2>
+      <p>정글시 크래프톤로 13, 1층 · 매일 08:00 – 21:00</p>
+    </section>
+  </main>
+
+  <footer>© 모퉁이 커피 · Tiny Web Server로 서빙 중</footer>
+  <script src="/js/app.js"></script>
+</body>
+</html>

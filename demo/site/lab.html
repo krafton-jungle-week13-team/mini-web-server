@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>서버 실험실 · 모퉁이 커피</title>
+  <link rel="icon" href="/img/favicon.png">
+  <link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <a href="/" class="brand"><img src="/img/logo.png" alt="" width="40" height="40">모퉁이 커피</a>
+    <nav>
+      <a href="/">홈</a>
+      <a href="/cgi-bin/guestbook">방명록</a>
+      <a href="/lab.html" class="lab-link">서버 실험실</a>
+    </nav>
+  </header>
+
+  <main>
+    <h1>서버 실험실</h1>
+    <p>Tiny 서버의 기능과 한계를 브라우저에서 직접 확인하는 페이지예요. 개발자 도구의 Network 탭을 열어 두고 보세요.</p>
+
+    <section class="lab">
+      <h2>1. 블로킹: 느린 CGI</h2>
+      <p><a href="/cgi-bin/slow?sec=5" target="_blank">/cgi-bin/slow?sec=5</a>를 새 탭으로 열고, 5초가 지나기 전에
+        이 탭에서 <a href="/" target="_blank">홈</a>을 새로 열어 보세요.
+        서버가 CGI가 끝나기를 <code>wait</code>로 기다리는 동안 다른 요청도 모두 멈춰요.</p>
+      <button type="button" id="block-test">자동으로 측정하기</button>
+      <pre id="block-out" class="out">버튼을 누르면 slow(3초)와 home.html을 동시에 요청하고 각각 걸린 시간을 보여 줘요.</pre>
+    </section>
+
+    <section class="lab">
+      <h2>2. 블로킹: 큰 파일</h2>
+      <p><a href="/img/big-photo.jpg" target="_blank">big-photo.jpg (약 5MB)</a>.
+        Network 탭에서 스로틀링을 "Slow 4G"로 두고 받는 동안 다른 탭에서 홈을 열어 보세요.
+        서버가 응답을 끝까지 쓰기 전에는 다음 연결로 넘어가지 않아요.</p>
+    </section>
+
+    <section class="lab">
+      <h2>3. Keep-alive 없음</h2>
+      <p>홈을 새로고침하고 Network 탭에서 <b>Connection ID</b> 열을 켜 보세요(열 이름에서 오른쪽 클릭).
+        파일마다 ID가 다르면 요청마다 새 TCP 연결을 연 거예요. 응답 헤더는 항상 <code>HTTP/1.0</code>, <code>Connection: close</code>예요.</p>
+    </section>
+
+    <section class="lab">
+      <h2>4. 에러 응답</h2>
+      <ul>
+        <li><a href="/no-such-page.html">없는 페이지</a> → 404</li>
+        <li><a href="/secret.html">권한 없는 파일 (secret.html)</a> → 403</li>
+        <li><a href="/api/no-such.txt">백엔드에 없는 파일</a> → 백엔드가 돌려준 404를 그대로 전달</li>
+      </ul>
+      <button type="button" id="err-test">POST 에러 한꺼번에 확인</button>
+      <pre id="err-out" class="out">405(정적 파일에 POST), 413(8KB 초과 body), 501(PUT)를 요청해서 상태 코드를 보여 줘요.</pre>
+    </section>
+
+    <section class="lab">
+      <h2>5. 리버스 프록시와 라운드로빈</h2>
+      <button type="button" id="rr-test">/api/menu.txt 6번 요청</button>
+      <pre id="rr-out" class="out">요청마다 응답한 백엔드를 보여 줘요.</pre>
+      <p>백엔드를 하나 끄면(<code>kill</code>) 그 차례의 요청은 502가 나요. 헬스 체크나 재시도가 없기 때문이에요.</p>
+    </section>
+  </main>
+
+  <footer>© 모퉁이 커피 · Tiny Web Server로 서빙 중</footer>
+  <script src="/js/lab.js"></script>
+</body>
+</html>

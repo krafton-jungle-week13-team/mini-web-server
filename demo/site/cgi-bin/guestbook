@@ -1,0 +1,96 @@
+#!/bin/bash
+# 방명록 CGI
+#   GET  /cgi-bin/guestbook          → 글 목록 + 작성 폼
+#   POST /cgi-bin/guestbook (form)   → 글 저장 후 목록 + 폼
+# 서버가 상태 줄(200)과 Server 헤더를 먼저 보내므로, 여기서는 나머지 헤더와 본문만 출력한다.
+
+shopt -u patsub_replacement 2>/dev/null   # bash 5.2+: 치환 문자열의 &를 매치로 해석하지 않게
+
+DB="$(cd "$(dirname "$0")/../.." && pwd)/guestbook.db"   # demo/guestbook.db (정적 경로 밖)
+
+urldecode() {                       # + → 공백, %XX → 바이트
+    local s="${1//+/ }"
+    printf '%b' "${s//%/\\x}"
+}
+html_escape() {
+    local s="$1"
+    s="${s//&/&amp;}"; s="${s//</&lt;}"; s="${s//>/&gt;}"; s="${s//\"/&quot;}"
+    printf '%s' "$s"
+}
+field() {                           # field <이름> <폼 데이터>
+    local pair
+    IFS='&' read -ra pairs <<< "$2"
+    for pair in "${pairs[@]}"; do
+        [ "${pair%%=*}" = "$1" ] && { urldecode "${pair#*=}"; return; }
+    done
+}
+
+notice=""
+if [ "$REQUEST_METHOD" = "POST" ]; then
+    body=""
+    [ -n "$CONTENT_LENGTH" ] && body=$(head -c "$CONTENT_LENGTH")
+    name=$(field name "$body" | tr -d '\t\r' | tr '\n' ' ')
+    msg=$(field msg "$body" | tr -d '\t\r')
+    msg=${msg//$'\n'/\\n}           # 한 줄에 한 글로 저장
+    name=${name:-익명}
+    if [ -z "$msg" ]; then
+        notice="내용을 입력해 주세요."
+    else
+        printf '%s\t%s\t%s\n' "$(date '+%Y-%m-%d %H:%M')" "${name:0:30}" "$msg" >> "$DB"
+        notice="글이 등록됐어요. 감사합니다!"
+    fi
+fi
+
+entries=""
+count=0
+if [ -f "$DB" ]; then
+    while IFS=$'\t' read -r when who text; do
+        text=${text//\\n/$'\n'}
+        entries+="<li><div class=\"meta\">$(html_escape "$who") · $when</div>$(html_escape "$text")</li>"
+        count=$((count + 1))
+    done < <(tail -n 50 "$DB" | tac)
+fi
+[ $count -eq 0 ] && entries="<li>아직 글이 없어요. 첫 글을 남겨 주세요.</li>"
+[ -n "$notice" ] && notice="<p class=\"notice\">$notice</p>"
+
+page=$(cat <<EOF
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>방명록 · 모퉁이 커피</title>
+  <link rel="icon" href="/img/favicon.png">
+  <link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <a href="/" class="brand"><img src="/img/logo.png" alt="" width="40" height="40">모퉁이 커피</a>
+    <nav>
+      <a href="/">홈</a>
+      <a href="/cgi-bin/guestbook">방명록</a>
+      <a href="/lab.html" class="lab-link">서버 실험실</a>
+    </nav>
+  </header>
+  <main>
+    <h1>방명록</h1>
+    $notice
+    <form class="guest" method="POST" action="/cgi-bin/guestbook">
+      <input name="name" maxlength="30" placeholder="이름 (비워 두면 익명)">
+      <textarea name="msg" placeholder="한 줄 남겨 주세요"></textarea>
+      <button type="submit">남기기</button>
+      <small class="hint">이 폼은 POST로 전송돼요. 서버의 body 제한은 8KB라서, 아주 긴 글은 413 에러가 나요.</small>
+    </form>
+    <h2>최근 글 ($count)</h2>
+    <ul class="entries">$entries</ul>
+  </main>
+  <footer>© 모퉁이 커피 · 이 페이지는 CGI(bash)가 만들었어요</footer>
+</body>
+</html>
+EOF
+)
+
+printf 'Connection: close\r\n'
+printf 'Content-Type: text/html; charset=utf-8\r\n'
+printf 'Content-Length: %d\r\n\r\n' "$(printf '%s' "$page" | wc -c)"
+printf '%s' "$page"
