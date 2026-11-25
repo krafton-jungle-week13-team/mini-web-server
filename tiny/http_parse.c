@@ -32,44 +32,51 @@ int parse_content_length(const char *v, long *out)
     return 0;
 }
 
+int parse_header_line(char *buf, req_headers_t *h)
+{
+    char *colon, *name, *value;
+    size_t n = strlen(buf);
+    long len;
+
+    if (n == 0 || buf[n - 1] != '\n')          /* MAXLINE보다 긴 줄은 잘려서 \n이 없다 */
+        return -1;
+
+    printf("%s", buf);
+    
+    colon = strchr(buf, ':');
+    if (colon == NULL || colon == buf ||
+        colon[-1] == ' ' || colon[-1] == '\t')
+        return -1;
+    *colon = '\0';
+    name = buf;
+    value = trim(colon + 1);
+
+    if (!strcasecmp(name, "Host")) {
+        if (h->has_host)
+            return -1;
+        strncpy(h->host, value, MAXLINE - 1);
+        h->has_host = 1;
+    } else if (!strcasecmp(name, "Content-Length")) {
+        if (parse_content_length(value, &len) < 0)
+            return -1;
+        if (h->has_content_length && h->content_length != len)
+            return -1;
+        h->content_length = len;
+        h->has_content_length = 1;
+    }
+    return 0;
+}
+
 /* 빈 줄까지 헤더를 읽어 h에 채운다. 형식 오류나 빈 줄 전 EOF면 -1. */
 int read_requesthdrs(rio_t *rp, req_headers_t *h)
 {
-    char buf[MAXLINE], *colon, *name, *value;
-    ssize_t n;
-    long len;
-
+    char buf[MAXLINE];
     memset(h, 0, sizeof(*h));
-
-    while ((n = Rio_readlineb(rp, buf, MAXLINE)) > 0) {
+    while (Rio_readlineb(rp, buf, MAXLINE) > 0) {
         if (!strcmp(buf, "\r\n"))
             return 0;
-        if (buf[n - 1] != '\n')          /* MAXLINE보다 긴 줄은 잘려서 \n이 없다 */
+        if (parse_header_line(buf, h) < 0)
             return -1;
-
-        printf("%s", buf);
-
-        colon = strchr(buf, ':');
-        if (colon == NULL || colon == buf ||
-            colon[-1] == ' ' || colon[-1] == '\t')
-            return -1;
-        *colon = '\0';
-        name = buf;
-        value = trim(colon + 1);
-
-        if (!strcasecmp(name, "Host")) {
-            if (h->has_host)
-                return -1;
-            strncpy(h->host, value, MAXLINE - 1);
-            h->has_host = 1;
-        } else if (!strcasecmp(name, "Content-Length")) {
-            if (parse_content_length(value, &len) < 0)
-                return -1;
-            if (h->has_content_length && h->content_length != len)
-                return -1;
-            h->content_length = len;
-            h->has_content_length = 1;
-        }
     }
     return -1;                           /* 빈 줄 전에 EOF */
 }

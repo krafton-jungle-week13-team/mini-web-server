@@ -13,5 +13,6 @@ typedef struct {
 char *trim(char *s);
 int parse_content_length(const char *v, long *out);   /* 성공 0, 실패 -1 */
 int read_requesthdrs(rio_t *rp, req_headers_t *h);    /* 성공 0, 실패 -1 → 400 */
+int parse_header_line(char *buf, req_headers_t *h);
 
 #endif
